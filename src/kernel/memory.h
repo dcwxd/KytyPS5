@@ -179,6 +179,9 @@ struct GuestRangeChange {
 // of changes recorded since boot. Never waits on a lock, so a fault handler can call it.
 unsigned GetRecentRangeChanges(GuestRangeChange* out, unsigned capacity,
                                uint64_t* total) noexcept;
+// Only changes of 4 MiB or more, kept apart from the 64 KiB churn above.
+unsigned GetRecentLargeRangeChanges(GuestRangeChange* out, unsigned capacity,
+                                    uint64_t* total) noexcept;
 
 // The same idea for memory API calls: the request the guest made and the address we returned.
 struct GuestMemoryCall {
@@ -196,6 +199,11 @@ unsigned GetRecentMemoryCalls(GuestMemoryCall* out, unsigned capacity, uint64_t*
 // guest's 64 KiB allocator would otherwise push them out of the general ring.
 unsigned GetRecentNotableMemoryCalls(GuestMemoryCall* out, unsigned capacity,
                                      uint64_t* total) noexcept;
+// Only calls of 4 MiB or more. These are the ones that shape the address space (the guest stakes
+// out hundreds of gigabytes early on); they are rare enough to survive in their own ring for the
+// whole session instead of being pushed out by the 64 KiB allocator.
+unsigned GetRecentLargeMemoryCalls(GuestMemoryCall* out, unsigned capacity,
+                                   uint64_t* total) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

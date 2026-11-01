@@ -5924,7 +5924,7 @@ void TestRecentRangeChanges() {
 
 	// The guest's allocator issues 64 KiB calls all day, so a multi-megabyte request must survive
 	// in the smaller ring even after many of them.
-	constexpr uint64_t big_length = 0x200000;
+	constexpr uint64_t big_length = 0x800000;
 	void*              big        = nullptr;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&big, big_length, 0, big_length),
@@ -5951,6 +5951,26 @@ void TestRecentRangeChanges() {
 		}
 	}
 	Check(test, found_large, "a multi-megabyte reservation was pushed out of the notable ring");
+
+	// The large rings exist so the address-space-defining calls survive a long session. The same
+	// big reservation must still be there after 64 KiB churn.
+	uint64_t large_total = 0;
+	auto     large_count =
+	    Libs::LibKernel::Memory::GetRecentLargeMemoryCalls(calls.data(), calls.size(), &large_total);
+	found_large = false;
+	for (unsigned i = 0; i < large_count; i++) {
+		if (calls[i].len == big_length && calls[i].out_addr == reinterpret_cast<uint64_t>(big)) {
+			found_large = true;
+		}
+	}
+	Check(test, found_large, "the large-call ring lost a multi-megabyte reservation");
+
+	uint64_t   large_change_total = 0;
+	const auto large_change_count =
+	    Libs::LibKernel::Memory::GetRecentLargeRangeChanges(changes.data(), changes.size(),
+	                                                        &large_change_total);
+	Check(test, large_change_count != 0 && large_change_total >= large_change_count,
+	      "the large-change ring did not record the multi-megabyte reservation");
 
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(big), big_length),

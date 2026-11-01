@@ -709,11 +709,17 @@ static void PrintMemoryCalls(const char* title, const Libs::LibKernel::Memory::G
 }
 
 static void PrintRecentMemoryCalls(uint64_t focus) {
-	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 96> calls {};
+	// Enough to show a sequence, small enough that the report stays readable. The large-call ring
+	// below is the one that keeps the address-space-defining calls for the whole session.
+	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 48> calls {};
 	uint64_t                                                 total = 0;
 
-	auto count = Libs::LibKernel::Memory::GetRecentNotableMemoryCalls(calls.data(), calls.size(),
-	                                                                 &total);
+	auto count = Libs::LibKernel::Memory::GetRecentLargeMemoryCalls(calls.data(), calls.size(),
+	                                                               &total);
+	PrintMemoryCalls("recent large memory calls (>= 4 MiB)", calls.data(), count, total, focus);
+
+	count = Libs::LibKernel::Memory::GetRecentNotableMemoryCalls(calls.data(), calls.size(),
+	                                                            &total);
 	PrintMemoryCalls("recent notable memory calls", calls.data(), count, total, focus);
 
 	count = Libs::LibKernel::Memory::GetRecentMemoryCalls(calls.data(), calls.size(), &total);
@@ -723,16 +729,14 @@ static void PrintRecentMemoryCalls(uint64_t focus) {
 // Replays the range-table mutations that led to the crash. Only the surviving mappings are visible
 // in the fault context above, so a buffer the guest reserved but never committed looks identical
 // to one that was never mentioned at all.
-static void PrintRecentRangeChanges() {
-	std::array<Libs::LibKernel::Memory::GuestRangeChange, 96> changes {};
-	uint64_t                                                   total = 0;
-	const auto count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(),
-	                                                                changes.size(), &total);
+static void PrintRangeChanges(const char* title,
+                              const Libs::LibKernel::Memory::GuestRangeChange* changes,
+                              unsigned count, uint64_t total) {
 	if (count == 0) {
 		return;
 	}
 
-	std::printf("--- recent guest range changes (oldest first%s) ---\n",
+	std::printf("--- %s (oldest first%s) ---\n", title,
 	            total > count ? ", older ones dropped" : "");
 	for (unsigned i = 0; i < count; i++) {
 		const auto& change = changes[i];
@@ -740,6 +744,20 @@ static void PrintRecentRangeChanges() {
 		            change.op, change.kind, change.name, change.start, change.start + change.size,
 		            change.size);
 	}
+}
+
+static void PrintRecentRangeChanges() {
+	std::array<Libs::LibKernel::Memory::GuestRangeChange, 64> changes {};
+	uint64_t                                                  total = 0;
+
+	// The large ring is never flushed by the 64 KiB churn, so it still shows how the big
+	// reservations came about even after the general ring has rolled over many times.
+	auto count = Libs::LibKernel::Memory::GetRecentLargeRangeChanges(changes.data(),
+	                                                                changes.size(), &total);
+	PrintRangeChanges("large guest range changes (>= 4 MiB)", changes.data(), count, total);
+
+	count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(), changes.size(), &total);
+	PrintRangeChanges("recent guest range changes", changes.data(), count, total);
 }
 
 // Reports module+offset and the nearest guest mapping for a value that should be an address.
