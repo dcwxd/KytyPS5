@@ -893,6 +893,69 @@ static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
 	PrintNearestMappedRange(vaddr, mapping);
 }
 
+// The fault context names only the ranges around each pointer. The question a store far past
+// the end of its mapping raises is how much address space the guest was actually given, and the
+// answer is the layout between the base register and the fault, not one neighbour. Adjacent
+// ranges of the same kind and name are compressed because the guest maps direct memory in small
+// pieces that are never coalesced in the table.
+static void PrintGuestRangeWindow(uint64_t fault, uint64_t base, const char* base_name) {
+	constexpr uint64_t kBack    = 0x20000000;
+	constexpr uint64_t kForward = 0x4000000;
+	constexpr uint64_t kReach   = 0x40000000;
+
+	uint64_t low  = fault > kBack ? fault - kBack : 0;
+	uint64_t high = fault > UINT64_MAX - kForward ? UINT64_MAX : fault + kForward;
+	// Keep the base of the faulting access in view when it sits just outside the default window.
+	if (base != 0 && base < low && low - base <= kReach) {
+		low = base;
+	}
+	if (base != 0 && base > high && base - high <= kReach) {
+		high = base > UINT64_MAX - 0x1000 ? UINT64_MAX : base + 0x1000;
+	}
+
+	std::array<Libs::LibKernel::Memory::GuestRangeRun, 64> runs {};
+	uint64_t                                               total = 0;
+	bool                                                   busy  = false;
+	const auto count = Libs::LibKernel::Memory::GetGuestRangeRuns(low, high, runs.data(),
+	                                                             runs.size(), &total, &busy);
+
+	std::printf("--- guest ranges in [%016" PRIx64 "..%016" PRIx64
+	            "), adjacent same-kind ranges compressed ---\n",
+	            low, high);
+	if (busy) {
+		std::printf("  (mapping table busy)\n");
+		return;
+	}
+	if (count == 0) {
+		std::printf("  (none)\n");
+		return;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		const auto& run = runs[i];
+		const auto  end =
+		    run.size > UINT64_MAX - run.start ? UINT64_MAX : run.start + run.size;
+		std::printf("  %-9s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64, run.kind,
+		            run.name, run.start, end, run.size);
+		if (run.count > 1) {
+			std::printf(" (%u ranges", run.count);
+			if (run.unit_size != 0) {
+				std::printf(", unit 0x%" PRIx64, run.unit_size);
+			}
+			std::printf(")");
+		}
+		if (fault >= run.start && fault - run.start < run.size) {
+			std::printf(" <- fault");
+		}
+		if (base != 0 && base >= run.start && base - run.start < run.size) {
+			std::printf(" <- %s", base_name);
+		}
+		std::printf("\n");
+	}
+	if (total > count) {
+		std::printf("  ... %" PRIu64 " more runs in the window ...\n", total - count);
+	}
+}
+
 static void PrintCodeWindow(const char* label, uint64_t address, int before, int after) {
 	if (before < 0 || after < 0) {
 		return;
@@ -976,6 +1039,28 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			for (const auto& reg: registers) {
 				if (reg.value >= kGuestPointerFloor) {
 					PrintGuestAddressInfo(reg.name, reg.value);
+				}
+			}
+			// A store far past the end of its own mapping is only explicable by the layout
+			// between the buffer base and the fault. The highest register below the fault that
+			// is close to it is the base the access was derived from in index/store loops.
+			if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+			    info->access_violation_vaddr != 0) {
+				const uint64_t fault     = info->access_violation_vaddr;
+				uint64_t       base      = 0;
+				const char*    base_name = nullptr;
+				for (const auto& reg: registers) {
+					if (reg.value < kGuestPointerFloor || reg.value >= fault ||
+					    fault - reg.value > 0x40000000) {
+						continue;
+					}
+					if (reg.value > base) {
+						base      = reg.value;
+						base_name = reg.name;
+					}
+				}
+				if (base != 0) {
+					PrintGuestRangeWindow(fault, base, base_name);
 				}
 			}
 		}

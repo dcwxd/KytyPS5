@@ -165,6 +165,23 @@ struct GuestAddressInfo {
 };
 [[nodiscard]] bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept;
 
+// A run of adjacent guest ranges of the same kind and name. The guest maps direct memory in
+// pieces that are never merged in the table (2 MiB at a time in the worst case), so a fault
+// report that listed every range around a fault would be hundreds of identical lines.
+struct GuestRangeRun {
+	uint64_t    start     = 0;
+	uint64_t    size      = 0; // Bytes covered by the whole run.
+	unsigned    count     = 0; // Underlying ranges in the run.
+	uint64_t    unit_size = 0; // Size of one range when they are all equal, otherwise 0.
+	const char* kind      = "";
+	char        name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
+};
+// Fills at most `capacity` runs for the ranges intersecting [start, end), oldest first.
+// `*total` receives the number of runs in the window, including ones that did not fit.
+// `*busy` is set when the table was locked and nothing was read; the call never waits for it.
+unsigned GetGuestRangeRuns(uint64_t start, uint64_t end, GuestRangeRun* out, unsigned capacity,
+                           uint64_t* total, bool* busy) noexcept;
+
 // The most recent mutations of the guest range table, oldest first. A fault report that only
 // shows the surviving mappings cannot tell whether a large buffer was ever committed, so the
 // crash reporter replays which ranges the guest asked for and in which order.

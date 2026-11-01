@@ -6075,6 +6075,76 @@ void TestPoolReserveAmidMergedReservations() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGuestRangeRunsAroundFault() {
+	const char* test = "GuestRangeRunsAroundFault";
+
+	// Direct mappings are exempt from coalescing, so a buffer the guest sees as one region is a
+	// row of table entries. The fault report has to compress those rows, otherwise a window over
+	// a 180 MiB buffer is hundreds of identical lines.
+	constexpr auto page = SceKernelPageSize;
+	int64_t        physical = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), page * 2, page,
+	            SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+
+	void* reserved = nullptr;
+	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserved, page * 4, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserved);
+
+	void* first = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &first, page, SceKernelProtCpuRw, SceKernelMapFixed, physical, page, "window"),
+	        "KernelMapNamedDirectMemory(first)");
+	void* second = reinterpret_cast<void*>(base + page);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &second, page, SceKernelProtCpuRw, SceKernelMapFixed, physical + page, page,
+	            "window"),
+	        "KernelMapNamedDirectMemory(second)");
+
+	std::array<Libs::LibKernel::Memory::GuestRangeRun, 8> runs {};
+	uint64_t                                               total = 0;
+	bool                                                   busy  = false;
+	auto count = Libs::LibKernel::Memory::GetGuestRangeRuns(base, base + page * 3, runs.data(),
+	                                                       runs.size(), &total, &busy);
+	Check(test, !busy && count == 2 && total == 2,
+	      "the window did not compress the adjacent direct mappings into two runs");
+	Check(test,
+	      std::strcmp(runs[0].kind, "direct") == 0 && std::strcmp(runs[0].name, "window") == 0 &&
+	          runs[0].start == base && runs[0].size == page * 2 && runs[0].count == 2 &&
+	          runs[0].unit_size == page,
+	      "the compressed direct run does not describe the two mapped pages");
+	Check(test,
+	      std::strcmp(runs[1].kind, "reserved") == 0 && runs[1].start == base + page * 2 &&
+	          runs[1].size == page * 2 && runs[1].count == 1,
+	      "the reservation following the mappings was not reported as its own run");
+
+	// A capacity limit must not change what the window reports as its size, only how much of it
+	// is printed: the report says how many runs it had to leave out.
+	total = 0;
+	count = Libs::LibKernel::Memory::GetGuestRangeRuns(base, base + page * 3, runs.data(), 1, &total,
+	                                                  &busy);
+	Check(test, !busy && count == 1 && total == 2,
+	      "a truncated window lost or invented runs");
+	Check(test, runs[0].count == 2, "the truncated window changed the first run");
+
+	count = Libs::LibKernel::Memory::GetGuestRangeRuns(base + page * 3, base, runs.data(),
+	                                                  runs.size(), &total, &busy);
+	Check(test, !busy && count == 0 && total == 0, "an empty window was not empty");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + page * 2, page * 2),
+	        "KernelMunmap(reserved)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, page * 2),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
@@ -6221,6 +6291,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDescribeGuestAddressAroundFault);
 	RunTest(TestRecentRangeChanges);
+	RunTest(TestGuestRangeRunsAroundFault);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);

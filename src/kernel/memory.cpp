@@ -629,6 +629,92 @@ public:
 		return found;
 	}
 
+	// Fatal-report query: every range intersecting [start, end), compressed into runs of
+	// adjacent ranges that share a kind and name. Coalescing would normally have removed such
+	// neighbours, but direct mappings are exempt from it, so a window over one buffer still
+	// contains a few hundred 2 MiB entries that differ only in their address.
+	unsigned TryQueryWindow(uint64_t start, uint64_t end, GuestRangeRun* out, unsigned capacity,
+	                        uint64_t* total, bool* busy) {
+		EXIT_IF(out == nullptr || total == nullptr || busy == nullptr);
+
+		*busy  = false;
+		*total = 0;
+		if (capacity == 0 || start >= end) {
+			return 0;
+		}
+		if (!m_mutex.TryLock()) {
+			*busy = true;
+			return 0;
+		}
+
+		unsigned written = 0;
+		// The window can begin inside a range, so start at its predecessor.
+		auto first = m_ranges.lower_bound(start);
+		if (first != m_ranges.begin()) {
+			const auto previous = std::prev(first);
+			if (start < End(previous->second.start, previous->second.size)) {
+				first = previous;
+			}
+		}
+
+		// The run being built lives outside `out` so that a full output buffer still compresses
+		// the rest of the window and `*total` counts every run, not just the printed ones.
+		bool        have_run  = false;
+		uint64_t    run_start = 0;
+		uint64_t    run_size  = 0;
+		uint64_t    run_unit  = 0;
+		unsigned    run_count = 0;
+		const char* run_kind  = "";
+		char        run_name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
+		uint64_t    run_total = 0;
+		const auto  flush     = [&] {
+			if (!have_run) {
+				return;
+			}
+			run_total++;
+			if (written < capacity) {
+				auto& run     = out[written++];
+				run.start     = run_start;
+				run.size      = run_size;
+				run.count     = run_count;
+				run.unit_size = run_unit;
+				run.kind      = run_kind;
+				CopyVirtualRangeName(run.name, run_name);
+			}
+			have_run = false;
+		};
+
+		for (auto it = first; it != m_ranges.end(); it++) {
+			const auto& range = it->second;
+			if (range.start >= end) {
+				break;
+			}
+			const auto* kind = VirtualRangeTypeName(range.type);
+			if (have_run && End(run_start, run_size) == range.start && run_kind == kind &&
+			    std::strncmp(run_name, range.name, KERNEL_MAXIMUM_NAME_LENGTH) == 0) {
+				run_size += range.size;
+				run_count++;
+				if (run_unit != range.size) {
+					run_unit = 0;
+				}
+				continue;
+			}
+			flush();
+			have_run  = true;
+			run_start = range.start;
+			run_size  = range.size;
+			run_unit  = range.size;
+			run_count = 1;
+			run_kind  = kind;
+			CopyVirtualRangeName(run_name, range.name);
+		}
+		flush();
+
+		*total = run_total;
+		m_mutex.Unlock();
+		return written;
+	}
+
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
@@ -3447,6 +3533,34 @@ bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept {
 
 	return contains || info->start != 0 || next_start != 0 || committed_contains ||
 	       info->committed_start != 0 || committed_next_start != 0;
+}
+
+unsigned GetGuestRangeRuns(uint64_t start, uint64_t end, GuestRangeRun* out, unsigned capacity,
+                           uint64_t* total, bool* busy) noexcept {
+	auto* ranges = g_virtual_ranges.get();
+	if (ranges == nullptr) {
+		if (total != nullptr) {
+			*total = 0;
+		}
+		if (busy != nullptr) {
+			*busy = false;
+		}
+		return 0;
+	}
+	// Same rule as DescribeGuestAddress(): a fault can land inside the memory subsystem, and
+	// the report must not deadlock waiting for it to finish.
+	if (!g_memory_operation_mutex.try_lock()) {
+		if (total != nullptr) {
+			*total = 0;
+		}
+		if (busy != nullptr) {
+			*busy = true;
+		}
+		return 0;
+	}
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex,
+	                                                           std::adopt_lock);
+	return ranges->TryQueryWindow(start, end, out, capacity, total, busy);
 }
 
 // Both rings are filled by one writer at a time and read without any lock, so each entry is
