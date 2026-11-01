@@ -26,6 +26,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
@@ -682,6 +683,28 @@ static void PrintNearestMappedRange(uint64_t vaddr,
 	std::printf("\n");
 }
 
+// Replays the range-table mutations that led to the crash. Only the surviving mappings are visible
+// in the fault context above, so a buffer the guest reserved but never committed looks identical
+// to one that was never mentioned at all.
+static void PrintRecentRangeChanges() {
+	std::array<Libs::LibKernel::Memory::GuestRangeChange, 40> changes {};
+	uint64_t                                                   total = 0;
+	const auto count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(),
+	                                                                changes.size(), &total);
+	if (count == 0) {
+		return;
+	}
+
+	std::printf("--- recent guest range changes (oldest first%s) ---\n",
+	            total > count ? ", older ones dropped" : "");
+	for (unsigned i = 0; i < count; i++) {
+		const auto& change = changes[i];
+		std::printf("%-7s %-9s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64 "\n",
+		            change.op, change.kind, change.name, change.start, change.start + change.size,
+		            change.size);
+	}
+}
+
 // Reports module+offset and the nearest guest mapping for a value that should be an address.
 static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
 	std::string module;
@@ -821,6 +844,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		std::fflush(stdout);
+		PrintRecentRangeChanges();
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

@@ -165,6 +165,21 @@ struct GuestAddressInfo {
 };
 [[nodiscard]] bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept;
 
+// The most recent mutations of the guest range table, oldest first. A fault report that only
+// shows the surviving mappings cannot tell whether a large buffer was ever committed, so the
+// crash reporter replays which ranges the guest asked for and in which order.
+struct GuestRangeChange {
+	uint64_t    start = 0;
+	uint64_t    size  = 0;
+	const char* op    = ""; // "add", "replace" or "remove"
+	const char* kind  = "";
+	char        name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
+};
+// Fills at most `capacity` entries and returns how many were written. `*total` receives the number
+// of changes recorded since boot. Never waits on a lock, so a fault handler can call it.
+unsigned GetRecentRangeChanges(GuestRangeChange* out, unsigned capacity,
+                               uint64_t* total) noexcept;
+
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags);

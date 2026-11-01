@@ -233,6 +233,37 @@ static int LogMemoryApiFailure(const char* api, int result) {
 	return result;
 }
 
+// Crash diagnostics: by the time a fault is reported, the range table only shows the state that
+// survived. The order in which mappings and reservations appeared (and where) is what explains a
+// guest pointer that looks reasonable but lands past the end of its own mapping.
+struct RangeChange {
+	std::atomic<uint64_t> seq {0};
+	uint64_t              start      = 0;
+	uint64_t              size       = 0;
+	const char*           op         = "";
+	const char*           kind       = "";
+	char                  name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
+};
+
+constexpr unsigned    kRangeChangeCount = 128;
+RangeChange           g_range_changes[kRangeChangeCount];
+std::atomic<uint64_t> g_range_change_sequence {0};
+
+// Writers run under the range-table mutex, so they never race each other. The crash reader runs
+// on the faulting thread without any lock, hence the per-entry seqlock.
+static void RecordRangeChange(const char* op, uint64_t start, uint64_t size,
+                              const char* kind, const char* name) {
+	const uint64_t number = g_range_change_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&          entry  = g_range_changes[(number - 1) % kRangeChangeCount];
+	entry.seq.store(number * 2 - 1, std::memory_order_relaxed);
+	entry.start = start;
+	entry.size  = size;
+	entry.op    = op;
+	entry.kind  = kind;
+	CopyVirtualRangeName(entry.name, name);
+	entry.seq.store(number * 2, std::memory_order_release);
+}
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static bool g_test_fail_next_range_replace = false;
 #endif
@@ -278,6 +309,7 @@ public:
 		auto inserted = m_ranges.emplace_hint(position, start, r);
 		UpdatePageTableEntries(inserted->second, true);
 		MergeAroundUnlocked(inserted);
+		RecordRangeChange("add", r.start, r.size, VirtualRangeTypeName(r.type), r.name);
 		return true;
 	}
 
@@ -286,6 +318,8 @@ public:
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
+			RecordRangeChange("remove", start, size, VirtualRangeTypeName(position->second.type),
+			                  position->second.name);
 			EraseUnlocked(position);
 			return true;
 		}
@@ -366,6 +400,8 @@ public:
 		first->second = replacement;
 		UpdatePageTableEntries(first->second, true);
 		MergeAroundUnlocked(first);
+		RecordRangeChange("replace", replacement.start, replacement.size,
+		                  VirtualRangeTypeName(replacement.type), replacement.name);
 		return true;
 	}
 
@@ -3258,6 +3294,55 @@ bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept {
 
 	return contains || info->start != 0 || next_start != 0 || committed_contains ||
 	       info->committed_start != 0 || committed_next_start != 0;
+}
+
+unsigned GetRecentRangeChanges(GuestRangeChange* out, unsigned capacity,
+                               uint64_t* total) noexcept {
+	if (out == nullptr || capacity == 0) {
+		return 0;
+	}
+
+	const auto recorded = g_range_change_sequence.load(std::memory_order_acquire);
+	if (total != nullptr) {
+		*total = recorded;
+	}
+
+	struct Snapshot {
+		uint64_t    seq;
+		GuestRangeChange change;
+	};
+	std::array<Snapshot, kRangeChangeCount> snapshots {};
+	unsigned                                count = 0;
+
+	for (const auto& entry: g_range_changes) {
+		const auto before = entry.seq.load(std::memory_order_acquire);
+		// Odd means a writer is midway through this slot; the data below may be torn.
+		if (before == 0 || (before % 2) != 0) {
+			continue;
+		}
+		Snapshot snapshot {};
+		snapshot.change.start = entry.start;
+		snapshot.change.size  = entry.size;
+		snapshot.change.op    = entry.op;
+		snapshot.change.kind  = entry.kind;
+		CopyVirtualRangeName(snapshot.change.name, entry.name);
+		if (entry.seq.load(std::memory_order_acquire) != before) {
+			continue;
+		}
+		snapshot.seq     = before;
+		snapshots[count] = snapshot;
+		count++;
+	}
+
+	std::sort(snapshots.begin(), snapshots.begin() + count,
+	          [](const Snapshot& a, const Snapshot& b) { return a.seq < b.seq; });
+
+	const unsigned skip  = (count > capacity ? count - capacity : 0);
+	const unsigned write = count - skip;
+	for (unsigned i = 0; i < write; i++) {
+		out[i] = snapshots[skip + i].change;
+	}
+	return write;
 }
 
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {

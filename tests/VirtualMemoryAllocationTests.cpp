@@ -5881,6 +5881,39 @@ void TestDescribeGuestAddressAroundFault() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestRecentRangeChanges() {
+	const char* test = "RecentRangeChanges";
+
+	std::array<Libs::LibKernel::Memory::GuestRangeChange, 8> changes {};
+	uint64_t                                                 total = 0;
+	auto count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(), changes.size(),
+	                                                            &total);
+	Check(test, count <= changes.size() && count <= total,
+	      "the change history reported more entries than were recorded");
+
+	void* addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&addr, SceKernelPageSize, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+
+	uint64_t total_after = 0;
+	count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(), changes.size(),
+	                                                       &total_after);
+	const auto& newest = changes[count - 1];
+	Check(test, total_after > total && count != 0, "the reservation was not recorded");
+	Check(test,
+	      std::strcmp(newest.kind, "reserved") == 0 && newest.start <= base &&
+	          base + SceKernelPageSize <= newest.start + newest.size,
+	      "the newest recorded change is not the reservation just made");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(reserved)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
@@ -6026,6 +6059,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDescribeGuestAddressAroundFault);
+	RunTest(TestRecentRangeChanges);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);
