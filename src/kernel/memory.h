@@ -180,6 +180,23 @@ struct GuestRangeChange {
 unsigned GetRecentRangeChanges(GuestRangeChange* out, unsigned capacity,
                                uint64_t* total) noexcept;
 
+// The same idea for memory API calls: the request the guest made and the address we returned.
+struct GuestMemoryCall {
+	uint64_t    in_addr  = 0;
+	uint64_t    len      = 0;
+	uint64_t    out_addr = 0;
+	uint64_t    aux      = 0;
+	const char* aux_name = "";
+	const char* api      = "";
+	int32_t     result   = 0;
+};
+// Same contract as GetRecentRangeChanges(); never waits on a lock.
+unsigned GetRecentMemoryCalls(GuestMemoryCall* out, unsigned capacity, uint64_t* total) noexcept;
+// Only the calls that span megabytes, failed, or returned an address other than the hint; the
+// guest's 64 KiB allocator would otherwise push them out of the general ring.
+unsigned GetRecentNotableMemoryCalls(GuestMemoryCall* out, unsigned capacity,
+                                     uint64_t* total) noexcept;
+
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags);

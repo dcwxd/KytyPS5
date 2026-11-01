@@ -245,7 +245,7 @@ struct RangeChange {
 	char                  name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
 };
 
-constexpr unsigned    kRangeChangeCount = 128;
+constexpr unsigned    kRangeChangeCount = 1024;
 RangeChange           g_range_changes[kRangeChangeCount];
 std::atomic<uint64_t> g_range_change_sequence {0};
 
@@ -267,6 +267,57 @@ static void RecordRangeChange(const char* op, uint64_t start, uint64_t size,
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static bool g_test_fail_next_range_replace = false;
 #endif
+
+// Address-space mutations only show where ranges ended up. The call that produced a range matters
+// just as much: a guest that asks for 256 MB at a hint and is given 2 MB elsewhere will happily
+// follow the pointer it got plus the size it wanted.
+struct MemoryCall {
+	std::atomic<uint64_t> seq {0};
+	uint64_t              in_addr  = 0;
+	uint64_t              len      = 0;
+	uint64_t              out_addr = 0;
+	uint64_t              aux      = 0;
+	const char*           aux_name = "";
+	const char*           api      = "";
+	int32_t               result   = 0;
+};
+
+constexpr unsigned    kMemoryCallCount = 1024;
+MemoryCall            g_memory_calls[kMemoryCallCount];
+std::atomic<uint64_t> g_memory_call_sequence {0};
+
+// The guest's allocator maps 64 KiB at a time, which buries the interesting calls. Anything that
+// spans megabytes, failed, or moved a requested address goes to a second, slower ring as well.
+constexpr unsigned    kNotableCallCount = 512;
+MemoryCall            g_notable_calls[kNotableCallCount];
+std::atomic<uint64_t> g_notable_call_sequence {0};
+
+// Same contract as RecordRangeChange(): writers hold the memory mutex, the crash reader does not.
+static void RecordMemoryCall(const char* api, uint64_t in_addr, uint64_t len, uint64_t out_addr,
+                             const char* aux_name, uint64_t aux, int result) {
+	auto fill = [&](MemoryCall& entry, uint64_t number) {
+		entry.seq.store(number * 2 - 1, std::memory_order_relaxed);
+		entry.in_addr  = in_addr;
+		entry.len      = len;
+		entry.out_addr = out_addr;
+		entry.aux      = aux;
+		entry.aux_name = aux_name;
+		entry.api      = api;
+		entry.result   = result;
+		entry.seq.store(number * 2, std::memory_order_release);
+	};
+
+	const uint64_t number = g_memory_call_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+	fill(g_memory_calls[(number - 1) % kMemoryCallCount], number);
+
+	const bool notable = result != OK || len >= 0x100000 ||
+	                     (in_addr != 0 && out_addr != 0 && in_addr != out_addr);
+	if (notable) {
+		const uint64_t notable_number =
+		    g_notable_call_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+		fill(g_notable_calls[(notable_number - 1) % kNotableCallCount], notable_number);
+	}
+}
 
 class VirtualRanges {
 public:
@@ -1870,11 +1921,15 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	*addr_in_out = reinterpret_cast<void*>(out_addr);
 
 	if (out_addr == 0) {
+		RecordMemoryCall("map-flexible", in_addr, len, 0, "flags", static_cast<uint32_t>(flags),
+		                 KERNEL_ERROR_ENOMEM);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
 	if (!g_flexible_memory->Map(out_addr, len, mode)) {
 		LOGF_COLOR(Log::Color::Red, "\t [Fail]\n");
+		RecordMemoryCall("map-flexible", in_addr, len, out_addr, "flags",
+		                 static_cast<uint32_t>(flags), KERNEL_ERROR_ENOMEM);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -1888,6 +1943,8 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	                                                   (map_flags & GUEST_MAP_NO_COALESCE) != 0);
 	if (!published) {
 		EXIT_IF(!g_flexible_memory->Unmap(out_addr, len));
+		RecordMemoryCall("map-flexible", in_addr, len, out_addr, "flags",
+		                 static_cast<uint32_t>(flags), KERNEL_ERROR_EBUSY);
 		return KERNEL_ERROR_EBUSY;
 	}
 
@@ -1904,6 +1961,9 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
 	}
+
+	RecordMemoryCall("map-flexible", in_addr, len, out_addr, "flags", static_cast<uint32_t>(flags),
+	                 OK);
 
 	return OK;
 }
@@ -2684,6 +2744,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	     shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
+		RecordMemoryCall("map-direct", in_addr, len, 0, "dmem",
+		                 static_cast<uint64_t>(direct_memory_start), KERNEL_ERROR_ENOMEM);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -2697,6 +2759,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		} else {
 			restore_mappings(replaced_mappings.size(), true);
 		}
+		RecordMemoryCall("map-direct", in_addr, len, out_addr, "dmem",
+		                 static_cast<uint64_t>(direct_memory_start), KERNEL_ERROR_EBUSY);
 		return KERNEL_ERROR_EBUSY;
 	}
 
@@ -2717,6 +2781,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		} else {
 			restore_mappings(replaced_mappings.size(), true);
 		}
+		RecordMemoryCall("map-direct", in_addr, len, out_addr, "dmem",
+		                 static_cast<uint64_t>(direct_memory_start), KERNEL_ERROR_EBUSY);
 		return KERNEL_ERROR_EBUSY;
 	}
 
@@ -2727,6 +2793,9 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	}
 
 	LOGF_COLOR(Log::Color::Green, "\t [Ok]\n");
+
+	RecordMemoryCall("map-direct", in_addr, len, out_addr, "dmem",
+	                 static_cast<uint64_t>(direct_memory_start), OK);
 
 	return OK;
 }
@@ -3065,17 +3134,23 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	}
 
 	if (out_addr == 0) {
+		RecordMemoryCall("reserve", in_addr, len, 0, "flags", static_cast<uint32_t>(flags),
+		                 KERNEL_ERROR_ENOMEM);
 		return LogMemoryApiFailure(__func__, KERNEL_ERROR_ENOMEM);
 	}
 
 	if (!range_already_added &&
 	    !g_virtual_ranges->Add(out_addr, len, 0, 0, 0, VirtualRangeType::Reserved, "anon")) {
+		RecordMemoryCall("reserve", in_addr, len, out_addr, "flags", static_cast<uint32_t>(flags),
+		                 KERNEL_ERROR_EBUSY);
 		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
 	}
 
 	*addr = reinterpret_cast<void*>(out_addr);
 
 	LOGF("\t out_addr  = 0x%016" PRIx64 "\n", out_addr);
+
+	RecordMemoryCall("reserve", in_addr, len, out_addr, "flags", static_cast<uint32_t>(flags), OK);
 
 	return OK;
 }
@@ -3296,53 +3371,111 @@ bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept {
 	       info->committed_start != 0 || committed_next_start != 0;
 }
 
-unsigned GetRecentRangeChanges(GuestRangeChange* out, unsigned capacity,
-                               uint64_t* total) noexcept {
+// Both rings are filled by one writer at a time and read without any lock, so each entry is
+// published through a seqlock and the report only has to look at the newest slots.
+template <unsigned N>
+static unsigned ReadRangeRing(const RangeChange (&entries)[N],
+                              const std::atomic<uint64_t>& sequence, GuestRangeChange* out,
+                              unsigned capacity, uint64_t* total) noexcept {
 	if (out == nullptr || capacity == 0) {
 		return 0;
 	}
 
-	const auto recorded = g_range_change_sequence.load(std::memory_order_acquire);
+	const uint64_t recorded = sequence.load(std::memory_order_acquire);
 	if (total != nullptr) {
 		*total = recorded;
 	}
 
-	struct Snapshot {
-		uint64_t    seq;
-		GuestRangeChange change;
-	};
-	std::array<Snapshot, kRangeChangeCount> snapshots {};
-	unsigned                                count = 0;
+	uint64_t available = recorded;
+	if (available > capacity) {
+		available = capacity;
+	}
+	if (available > N) {
+		available = N;
+	}
 
-	for (const auto& entry: g_range_changes) {
-		const auto before = entry.seq.load(std::memory_order_acquire);
-		// Odd means a writer is midway through this slot; the data below may be torn.
-		if (before == 0 || (before % 2) != 0) {
+	unsigned written = 0;
+	for (uint64_t i = 0; i < available; i++) {
+		const uint64_t number = recorded - available + i + 1;
+		const auto&    entry  = entries[(number - 1) % N];
+		const auto     before = entry.seq.load(std::memory_order_acquire);
+		// Overwritten already, or a writer is midway through the slot.
+		if (before != number * 2) {
 			continue;
 		}
-		Snapshot snapshot {};
-		snapshot.change.start = entry.start;
-		snapshot.change.size  = entry.size;
-		snapshot.change.op    = entry.op;
-		snapshot.change.kind  = entry.kind;
-		CopyVirtualRangeName(snapshot.change.name, entry.name);
+		GuestRangeChange change {};
+		change.start = entry.start;
+		change.size  = entry.size;
+		change.op    = entry.op;
+		change.kind  = entry.kind;
+		CopyVirtualRangeName(change.name, entry.name);
 		if (entry.seq.load(std::memory_order_acquire) != before) {
 			continue;
 		}
-		snapshot.seq     = before;
-		snapshots[count] = snapshot;
-		count++;
+		out[written] = change;
+		written++;
+	}
+	return written;
+}
+
+template <unsigned N>
+static unsigned ReadCallRing(const MemoryCall (&entries)[N],
+                             const std::atomic<uint64_t>& sequence, GuestMemoryCall* out,
+                             unsigned capacity, uint64_t* total) noexcept {
+	if (out == nullptr || capacity == 0) {
+		return 0;
 	}
 
-	std::sort(snapshots.begin(), snapshots.begin() + count,
-	          [](const Snapshot& a, const Snapshot& b) { return a.seq < b.seq; });
-
-	const unsigned skip  = (count > capacity ? count - capacity : 0);
-	const unsigned write = count - skip;
-	for (unsigned i = 0; i < write; i++) {
-		out[i] = snapshots[skip + i].change;
+	const uint64_t recorded = sequence.load(std::memory_order_acquire);
+	if (total != nullptr) {
+		*total = recorded;
 	}
-	return write;
+
+	uint64_t available = recorded;
+	if (available > capacity) {
+		available = capacity;
+	}
+	if (available > N) {
+		available = N;
+	}
+
+	unsigned written = 0;
+	for (uint64_t i = 0; i < available; i++) {
+		const uint64_t number = recorded - available + i + 1;
+		const auto&    entry  = entries[(number - 1) % N];
+		const auto     before = entry.seq.load(std::memory_order_acquire);
+		if (before != number * 2) {
+			continue;
+		}
+		GuestMemoryCall call {};
+		call.in_addr  = entry.in_addr;
+		call.len      = entry.len;
+		call.out_addr = entry.out_addr;
+		call.aux      = entry.aux;
+		call.aux_name = entry.aux_name;
+		call.api      = entry.api;
+		call.result   = entry.result;
+		if (entry.seq.load(std::memory_order_acquire) != before) {
+			continue;
+		}
+		out[written] = call;
+		written++;
+	}
+	return written;
+}
+
+unsigned GetRecentRangeChanges(GuestRangeChange* out, unsigned capacity,
+                               uint64_t* total) noexcept {
+	return ReadRangeRing(g_range_changes, g_range_change_sequence, out, capacity, total);
+}
+
+unsigned GetRecentMemoryCalls(GuestMemoryCall* out, unsigned capacity, uint64_t* total) noexcept {
+	return ReadCallRing(g_memory_calls, g_memory_call_sequence, out, capacity, total);
+}
+
+unsigned GetRecentNotableMemoryCalls(GuestMemoryCall* out, unsigned capacity,
+                                     uint64_t* total) noexcept {
+	return ReadCallRing(g_notable_calls, g_notable_call_sequence, out, capacity, total);
 }
 
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
@@ -3860,6 +3993,8 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	if (!g_virtual_ranges->ReplaceSpan(vaddr, len, VirtualRangeType::PoolReserved, 0, prot, type,
 	                                   VirtualRangeType::Pooled, old_range.name)) {
 		rollback();
+		RecordMemoryCall("pool-commit", vaddr, len, vaddr, "prot", static_cast<uint32_t>(prot),
+		                 KERNEL_ERROR_EBUSY);
 		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
 	}
 
@@ -3870,6 +4005,8 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	}
 
 	g_memory_pool_committed.fetch_add(len, std::memory_order_relaxed);
+
+	RecordMemoryCall("pool-commit", vaddr, len, vaddr, "prot", static_cast<uint32_t>(prot), OK);
 
 	return OK;
 }

@@ -5911,6 +5911,51 @@ void TestRecentRangeChanges() {
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
 	        "KernelMunmap(reserved)");
 
+	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 8> calls {};
+	uint64_t                                                call_total = 0;
+	auto call_count = Libs::LibKernel::Memory::GetRecentMemoryCalls(calls.data(), calls.size(),
+	                                                               &call_total);
+	Check(test, call_count != 0 && call_count <= call_total,
+	      "the call history did not record the reservation");
+	Check(test,
+	      std::strcmp(calls[call_count - 1].api, "reserve") == 0 &&
+	          calls[call_count - 1].out_addr == base && calls[call_count - 1].result == 0,
+	      "the newest recorded call is not the reservation just made");
+
+	// The guest's allocator issues 64 KiB calls all day, so a multi-megabyte request must survive
+	// in the smaller ring even after many of them.
+	constexpr uint64_t big_length = 0x200000;
+	void*              big        = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&big, big_length, 0, big_length),
+	        "KernelReserveVirtualRange(large)");
+	for (int i = 0; i < 64; i++) {
+		void* small = nullptr;
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelReserveVirtualRange(&small, SceKernelPageSize, 0,
+		                                                           SceKernelPageSize),
+		        "KernelReserveVirtualRange(small)");
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(
+		                  reinterpret_cast<uint64_t>(small), SceKernelPageSize),
+		        "KernelMunmap(small)");
+	}
+
+	uint64_t notable_total = 0;
+	const auto notable_count = Libs::LibKernel::Memory::GetRecentNotableMemoryCalls(
+	    calls.data(), calls.size(), &notable_total);
+	Check(test, notable_count != 0, "no notable calls were recorded");
+	bool found_large = false;
+	for (unsigned i = 0; i < notable_count; i++) {
+		if (calls[i].len == big_length && calls[i].out_addr != 0) {
+			found_large = true;
+		}
+	}
+	Check(test, found_large, "a multi-megabyte reservation was pushed out of the notable ring");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(big), big_length),
+	        "KernelMunmap(large)");
+
 	std::printf("[host]    %-48s ok\n", test);
 }
 

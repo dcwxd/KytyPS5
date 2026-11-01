@@ -683,11 +683,48 @@ static void PrintNearestMappedRange(uint64_t vaddr,
 	std::printf("\n");
 }
 
+// Replays the memory calls that shaped the address space. A guest pointer that is far past the end
+// of its own mapping makes sense only if we know what it asked for and what it got back.
+static void PrintMemoryCalls(const char* title, const Libs::LibKernel::Memory::GuestMemoryCall* calls,
+                             unsigned count, uint64_t total, uint64_t focus) {
+	if (count == 0) {
+		return;
+	}
+	std::printf("--- %s (oldest first%s) ---\n", title, total > count ? ", older ones dropped" : "");
+	for (unsigned i = 0; i < count; i++) {
+		const auto& call = calls[i];
+		// Mark the calls whose result spans the fault, including reservations the guest never
+		// committed: that is the range the guest thought it owned.
+		const bool covers =
+		    focus != 0 && call.out_addr != 0 && focus >= call.out_addr &&
+		    (call.len == 0 || focus - call.out_addr < call.len);
+		const bool hint_moved =
+		    call.in_addr != 0 && call.out_addr != 0 && call.in_addr != call.out_addr;
+		std::printf("%c %-12s in 0x%016" PRIx64 " len 0x%-10" PRIx64 " -> out 0x%016" PRIx64
+		            " %s 0x%" PRIx64 " ret 0x%08x%s\n",
+		            covers ? '*' : ' ', call.api, call.in_addr, call.len, call.out_addr,
+		            call.aux_name, call.aux, static_cast<uint32_t>(call.result),
+		            hint_moved ? " (hint moved)" : "");
+	}
+}
+
+static void PrintRecentMemoryCalls(uint64_t focus) {
+	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 96> calls {};
+	uint64_t                                                 total = 0;
+
+	auto count = Libs::LibKernel::Memory::GetRecentNotableMemoryCalls(calls.data(), calls.size(),
+	                                                                 &total);
+	PrintMemoryCalls("recent notable memory calls", calls.data(), count, total, focus);
+
+	count = Libs::LibKernel::Memory::GetRecentMemoryCalls(calls.data(), calls.size(), &total);
+	PrintMemoryCalls("recent memory calls", calls.data(), count, total, focus);
+}
+
 // Replays the range-table mutations that led to the crash. Only the surviving mappings are visible
 // in the fault context above, so a buffer the guest reserved but never committed looks identical
 // to one that was never mentioned at all.
 static void PrintRecentRangeChanges() {
-	std::array<Libs::LibKernel::Memory::GuestRangeChange, 40> changes {};
+	std::array<Libs::LibKernel::Memory::GuestRangeChange, 96> changes {};
 	uint64_t                                                   total = 0;
 	const auto count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(),
 	                                                                changes.size(), &total);
@@ -844,6 +881,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		std::fflush(stdout);
+		PrintRecentMemoryCalls(info->access_violation_vaddr);
 		PrintRecentRangeChanges();
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
