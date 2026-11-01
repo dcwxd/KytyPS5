@@ -903,19 +903,23 @@ static void PrintGuestRangeWindow(uint64_t fault, uint64_t base, const char* bas
 	constexpr uint64_t kForward = 0x4000000;
 	constexpr uint64_t kReach   = 0x40000000;
 
+	// The interesting span is the one the guest believes it owns: from the base of the access
+	// to the fault. Only fall back to a fixed window around the fault without a usable base.
 	uint64_t low  = fault > kBack ? fault - kBack : 0;
 	uint64_t high = fault > UINT64_MAX - kForward ? UINT64_MAX : fault + kForward;
-	// Keep the base of the faulting access in view when it sits just outside the default window.
-	if (base != 0 && base < low && low - base <= kReach) {
+	if (base != 0 && base <= fault && fault - base <= kReach) {
 		low = base;
 	}
 	if (base != 0 && base > high && base - high <= kReach) {
 		high = base > UINT64_MAX - 0x1000 ? UINT64_MAX : base + 0x1000;
 	}
 
-	std::array<Libs::LibKernel::Memory::GuestRangeRun, 64> runs {};
-	uint64_t                                               total = 0;
-	bool                                                   busy  = false;
+	constexpr unsigned kCapacity = 128;
+	constexpr unsigned kHead     = 40;
+	constexpr unsigned kTail     = 24;
+	std::array<Libs::LibKernel::Memory::GuestRangeRun, kCapacity> runs {};
+	uint64_t                                                       total = 0;
+	bool                                                           busy  = false;
 	const auto count = Libs::LibKernel::Memory::GetGuestRangeRuns(low, high, runs.data(),
 	                                                             runs.size(), &total, &busy);
 
@@ -930,8 +934,8 @@ static void PrintGuestRangeWindow(uint64_t fault, uint64_t base, const char* bas
 		std::printf("  (none)\n");
 		return;
 	}
-	for (unsigned i = 0; i < count; i++) {
-		const auto& run = runs[i];
+	const auto print_run = [&](unsigned index) {
+		const auto& run = runs[index];
 		const auto  end =
 		    run.size > UINT64_MAX - run.start ? UINT64_MAX : run.start + run.size;
 		std::printf("  %-9s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64, run.kind,
@@ -950,6 +954,23 @@ static void PrintGuestRangeWindow(uint64_t fault, uint64_t base, const char* bas
 			std::printf(" <- %s", base_name);
 		}
 		std::printf("\n");
+	};
+
+	// A guest heap maps a repeating stripe of direct chunks and alignment gaps, which fills even
+	// a compressed window with near-identical runs. Keep the ends: the base mapping and the
+	// ranges immediately around the fault are the ones that explain the overrun.
+	if (count <= kHead + kTail) {
+		for (unsigned i = 0; i < count; i++) {
+			print_run(i);
+		}
+		return;
+	}
+	for (unsigned i = 0; i < kHead; i++) {
+		print_run(i);
+	}
+	std::printf("  ... %u runs omitted ...\n", count - kHead - kTail);
+	for (unsigned i = count - kTail; i < count; i++) {
+		print_run(i);
 	}
 	if (total > count) {
 		std::printf("  ... %" PRIu64 " more runs in the window ...\n", total - count);
