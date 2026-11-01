@@ -750,7 +750,35 @@ static void PrintFilteredMemoryCalls(const char* title,
 	}
 }
 
-static void PrintRecentMemoryCalls(uint64_t focus) {
+// A fault far past the base of its own store is explained by whatever mapped that base: the
+// request and the length behind a 2 MiB mapping under a 700 MiB store. Filtering on "covers the
+// base" shows that call wherever it sits in the ring, which sampling the ends cannot.
+static void PrintMemoryCallsCovering(const char* title,
+                                     const Libs::LibKernel::Memory::GuestMemoryCall* calls,
+                                     unsigned count, uint64_t total, uint64_t address) {
+	if (count == 0 || address == 0) {
+		return;
+	}
+	bool have = false;
+	for (unsigned i = 0; i < count; i++) {
+		const auto& call = calls[i];
+		if (call.out_addr == 0 || call.len == 0 || address < call.out_addr ||
+		    address - call.out_addr >= call.len) {
+			continue;
+		}
+		if (!have) {
+			std::printf("--- %s (oldest first%s) ---\n", title,
+			            total > count ? ", older ones dropped" : "");
+			have = true;
+		}
+		PrintMemoryCall(call, address);
+	}
+	if (!have) {
+		std::printf("--- %s ---\n  (none)\n", title);
+	}
+}
+
+static void PrintRecentMemoryCalls(uint64_t focus, uint64_t base = 0) {
 	// Enough to show a sequence, small enough that the report stays readable. The rings below keep
 	// the address-space-defining calls for the whole session, so their beginnings are printed too.
 	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 512> calls {};
@@ -773,6 +801,18 @@ static void PrintRecentMemoryCalls(uint64_t focus) {
 
 	count = Libs::LibKernel::Memory::GetRecentMemoryCalls(calls.data(), calls.size(), &total);
 	PrintMemoryCalls("recent memory calls", calls.data(), count, total, focus, 0, 16);
+
+	// What created the mapping under the faulting store: the size the guest asked for is the
+	// difference between "the game wanted 700 MiB here" and "the base register is not the buffer".
+	if (base != 0 && base != focus) {
+		count = Libs::LibKernel::Memory::GetRecentNotableMemoryCalls(calls.data(), calls.size(),
+		                                                            &total);
+		PrintMemoryCallsCovering("memory calls covering the access base", calls.data(), count, total,
+		                         base);
+		count = Libs::LibKernel::Memory::GetRecentMemoryCalls(calls.data(), calls.size(), &total);
+		PrintMemoryCallsCovering("all memory calls covering the access base", calls.data(), count,
+		                         total, base);
+	}
 }
 
 // Replays the range-table mutations that led to the crash. Only the surviving mappings are visible
@@ -1063,6 +1103,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 			PrintGuestAddressInfo("fault", info->access_violation_vaddr);
 		}
+		// The base of the faulting store is needed again when the memory calls are replayed:
+		// which call created the mapping under the store decides whether the guest asked for
+		// the wrong size or was given the wrong address.
+		uint64_t    access_base      = 0;
+		const char* access_base_name = nullptr;
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -1089,25 +1134,74 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 			// A store far past the end of its own mapping is only explicable by the layout
-			// between the buffer base and the fault. The highest register below the fault that
-			// is close to it is the base the access was derived from in index/store loops.
+			// between the buffer base and the fault. The store loops that dominate guest memory
+			// traffic compute the fault as base + index, and both are in the register file: the
+			// pair that adds up exactly beats any proximity guess, which happily picks the source
+			// pointer of a copy over its destination.
 			if (info->type == Common::HostException::ExceptionType::AccessViolation &&
 			    info->access_violation_vaddr != 0) {
-				const uint64_t fault     = info->access_violation_vaddr;
-				uint64_t       base      = 0;
-				const char*    base_name = nullptr;
-				for (const auto& reg: registers) {
-					if (reg.value < kGuestPointerFloor || reg.value >= fault ||
-					    fault - reg.value > 0x40000000) {
-						continue;
+				const uint64_t fault = info->access_violation_vaddr;
+				const auto     mapped = [](uint64_t value) {
+					Libs::LibKernel::Memory::GuestAddressInfo mapping {};
+					return Libs::LibKernel::Memory::DescribeGuestAddress(value, &mapping) &&
+					       mapping.contains_committed;
+				};
+				const auto find_base = [&](bool require_mapped, uint64_t* out_base,
+				                           const char** out_index) -> const char* {
+					for (const auto& candidate: registers) {
+						if (candidate.value < kGuestPointerFloor || candidate.value >= fault ||
+						    (require_mapped && !mapped(candidate.value))) {
+							continue;
+						}
+						const uint64_t offset = fault - candidate.value;
+						for (const auto& other: registers) {
+							if (&other == &candidate || other.value != offset) {
+								continue;
+							}
+							*out_base  = candidate.value;
+							*out_index = other.name;
+							return candidate.name;
+						}
 					}
-					if (reg.value > base) {
-						base      = reg.value;
-						base_name = reg.name;
+					return nullptr;
+				};
+				uint64_t    base       = 0;
+				const char* base_name  = nullptr;
+				const char* index_name = nullptr;
+				base_name              = find_base(true, &base, &index_name);
+				if (base_name == nullptr) {
+					base_name = find_base(false, &base, &index_name);
+				}
+				if (base_name == nullptr) {
+					for (const auto& reg: registers) {
+						if (reg.value < kGuestPointerFloor || reg.value >= fault ||
+						    fault - reg.value > 0x40000000) {
+							continue;
+						}
+						if (reg.value > base) {
+							base      = reg.value;
+							base_name = reg.name;
+						}
 					}
+					index_name = "?";
 				}
 				if (base != 0) {
+					access_base      = base;
+					access_base_name = base_name;
+					std::printf("access  %016" PRIx64 " = %s + %s (0x%" PRIx64 ")\n", fault,
+					            base_name, index_name, fault - base);
 					PrintGuestRangeWindow(fault, base, base_name);
+					// The first bytes of the base buffer are its header: a size or descriptor
+					// field there says whether the store was meant for this buffer at all.
+					constexpr int kBaseDump = 0x100;
+					if (IsReadableRange(base, kBaseDump)) {
+						const auto* bytes = reinterpret_cast<const uint8_t*>(base);
+						std::printf("base %s bytes:", base_name);
+						for (int i = 0; i < kBaseDump; i++) {
+							std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", bytes[i]);
+						}
+						std::printf("\n");
+					}
 				}
 			}
 		}
@@ -1180,7 +1274,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		std::fflush(stdout);
-		PrintRecentMemoryCalls(info->access_violation_vaddr);
+		PrintRecentMemoryCalls(info->access_violation_vaddr, access_base);
 		PrintRecentRangeChanges();
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
