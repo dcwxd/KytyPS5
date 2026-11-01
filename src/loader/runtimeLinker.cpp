@@ -685,79 +685,109 @@ static void PrintNearestMappedRange(uint64_t vaddr,
 
 // Replays the memory calls that shaped the address space. A guest pointer that is far past the end
 // of its own mapping makes sense only if we know what it asked for and what it got back.
+static void PrintMemoryCall(const Libs::LibKernel::Memory::GuestMemoryCall& call, uint64_t focus) {
+	// Mark the calls whose result spans the fault, including reservations the guest never
+	// committed: that is the range the guest thought it owned.
+	const bool covers = focus != 0 && call.out_addr != 0 && focus >= call.out_addr &&
+	                    (call.len == 0 || focus - call.out_addr < call.len);
+	const bool hint_moved =
+	    call.in_addr != 0 && call.out_addr != 0 && call.in_addr != call.out_addr;
+	std::printf("%c %-12s in 0x%016" PRIx64 " len 0x%-10" PRIx64 " -> out 0x%016" PRIx64
+	            " %s 0x%" PRIx64 " ret 0x%08x%s\n",
+	            covers ? '*' : ' ', call.api, call.in_addr, call.len, call.out_addr, call.aux_name,
+	            call.aux, static_cast<uint32_t>(call.result), hint_moved ? " (hint moved)" : "");
+}
+
+// print_head keeps the beginning of a long-lived ring visible: the allocations that shaped the
+// address space happen early, so showing only the newest entries hides exactly what matters.
 static void PrintMemoryCalls(const char* title, const Libs::LibKernel::Memory::GuestMemoryCall* calls,
-                             unsigned count, uint64_t total, uint64_t focus) {
+                             unsigned count, uint64_t total, uint64_t focus, unsigned print_head,
+                             unsigned print_tail) {
 	if (count == 0) {
 		return;
 	}
 	std::printf("--- %s (oldest first%s) ---\n", title, total > count ? ", older ones dropped" : "");
-	for (unsigned i = 0; i < count; i++) {
-		const auto& call = calls[i];
-		// Mark the calls whose result spans the fault, including reservations the guest never
-		// committed: that is the range the guest thought it owned.
-		const bool covers =
-		    focus != 0 && call.out_addr != 0 && focus >= call.out_addr &&
-		    (call.len == 0 || focus - call.out_addr < call.len);
-		const bool hint_moved =
-		    call.in_addr != 0 && call.out_addr != 0 && call.in_addr != call.out_addr;
-		std::printf("%c %-12s in 0x%016" PRIx64 " len 0x%-10" PRIx64 " -> out 0x%016" PRIx64
-		            " %s 0x%" PRIx64 " ret 0x%08x%s\n",
-		            covers ? '*' : ' ', call.api, call.in_addr, call.len, call.out_addr,
-		            call.aux_name, call.aux, static_cast<uint32_t>(call.result),
-		            hint_moved ? " (hint moved)" : "");
+	if (count <= print_head + print_tail) {
+		for (unsigned i = 0; i < count; i++) {
+			PrintMemoryCall(calls[i], focus);
+		}
+		return;
+	}
+	for (unsigned i = 0; i < print_head; i++) {
+		PrintMemoryCall(calls[i], focus);
+	}
+	std::printf("  ... %u entries omitted ...\n", count - print_head - print_tail);
+	for (unsigned i = count - print_tail; i < count; i++) {
+		PrintMemoryCall(calls[i], focus);
 	}
 }
 
 static void PrintRecentMemoryCalls(uint64_t focus) {
 	// Enough to show a sequence, small enough that the report stays readable. The large-call ring
-	// below is the one that keeps the address-space-defining calls for the whole session.
-	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 48> calls {};
+	// below is the one that keeps the address-space-defining calls for the whole session, so its
+	// beginning is printed as well as its end.
+	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 64> calls {};
 	uint64_t                                                 total = 0;
 
 	auto count = Libs::LibKernel::Memory::GetRecentLargeMemoryCalls(calls.data(), calls.size(),
 	                                                               &total);
-	PrintMemoryCalls("recent large memory calls (>= 4 MiB)", calls.data(), count, total, focus);
+	PrintMemoryCalls("large memory calls (>= 4 MiB)", calls.data(), count, total, focus, 24, 24);
 
 	count = Libs::LibKernel::Memory::GetRecentNotableMemoryCalls(calls.data(), calls.size(),
 	                                                            &total);
-	PrintMemoryCalls("recent notable memory calls", calls.data(), count, total, focus);
+	PrintMemoryCalls("recent notable memory calls", calls.data(), count, total, focus, 0, 24);
 
 	count = Libs::LibKernel::Memory::GetRecentMemoryCalls(calls.data(), calls.size(), &total);
-	PrintMemoryCalls("recent memory calls", calls.data(), count, total, focus);
+	PrintMemoryCalls("recent memory calls", calls.data(), count, total, focus, 0, 16);
 }
 
 // Replays the range-table mutations that led to the crash. Only the surviving mappings are visible
 // in the fault context above, so a buffer the guest reserved but never committed looks identical
 // to one that was never mentioned at all.
+static void PrintRangeChange(const Libs::LibKernel::Memory::GuestRangeChange& change) {
+	std::printf("%-7s %-9s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64 "\n",
+	            change.op, change.kind, change.name, change.start, change.start + change.size,
+	            change.size);
+}
+
 static void PrintRangeChanges(const char* title,
                               const Libs::LibKernel::Memory::GuestRangeChange* changes,
-                              unsigned count, uint64_t total) {
+                              unsigned count, uint64_t total, unsigned print_head,
+                              unsigned print_tail) {
 	if (count == 0) {
 		return;
 	}
 
 	std::printf("--- %s (oldest first%s) ---\n", title,
 	            total > count ? ", older ones dropped" : "");
-	for (unsigned i = 0; i < count; i++) {
-		const auto& change = changes[i];
-		std::printf("%-7s %-9s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64 "\n",
-		            change.op, change.kind, change.name, change.start, change.start + change.size,
-		            change.size);
+	if (count <= print_head + print_tail) {
+		for (unsigned i = 0; i < count; i++) {
+			PrintRangeChange(changes[i]);
+		}
+		return;
+	}
+	for (unsigned i = 0; i < print_head; i++) {
+		PrintRangeChange(changes[i]);
+	}
+	std::printf("  ... %u entries omitted ...\n", count - print_head - print_tail);
+	for (unsigned i = count - print_tail; i < count; i++) {
+		PrintRangeChange(changes[i]);
 	}
 }
 
 static void PrintRecentRangeChanges() {
-	std::array<Libs::LibKernel::Memory::GuestRangeChange, 64> changes {};
+	std::array<Libs::LibKernel::Memory::GuestRangeChange, 96> changes {};
 	uint64_t                                                  total = 0;
 
 	// The large ring is never flushed by the 64 KiB churn, so it still shows how the big
-	// reservations came about even after the general ring has rolled over many times.
+	// reservations came about even after the general ring has rolled over many times. Both of its
+	// ends matter: the huge reservations are usually the oldest surviving entries.
 	auto count = Libs::LibKernel::Memory::GetRecentLargeRangeChanges(changes.data(),
 	                                                                changes.size(), &total);
-	PrintRangeChanges("large guest range changes (>= 4 MiB)", changes.data(), count, total);
+	PrintRangeChanges("large guest range changes (>= 4 MiB)", changes.data(), count, total, 32, 32);
 
 	count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(), changes.size(), &total);
-	PrintRangeChanges("recent guest range changes", changes.data(), count, total);
+	PrintRangeChanges("recent guest range changes", changes.data(), count, total, 0, 24);
 }
 
 // Reports module+offset and the nearest guest mapping for a value that should be an address.
@@ -800,6 +830,22 @@ static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
 	}
 	std::printf(", below the first guest mapping 0x%" PRIx64 "\n", mapping.next_start);
 	PrintNearestMappedRange(vaddr, mapping);
+}
+
+static void PrintCodeWindow(const char* label, uint64_t address, int before, int after) {
+	if (before < 0 || after < 0) {
+		return;
+	}
+	const int total = before + after;
+	if (!IsReadableRange(address - before, total)) {
+		return;
+	}
+	const auto* code = reinterpret_cast<const uint8_t*>(address - before);
+	std::printf("%s-%d .. %s+%d:", label, before, label, after);
+	for (int i = 0; i < total; i++) {
+		std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+	}
+	std::printf("\n");
 }
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
@@ -893,21 +939,44 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("\n");
 			}
 		}
-		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
-			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+		// The callee spilled its parameters below rsp: the tiled-copy helper keeps the surface
+		// descriptor's base vector at [rsp-0x48] and the caller's swizzle mask at [rsp-0x28].
+		// Dumping below rsp shows the vector that produced the huge destination offsets.
+		{
+			constexpr int kStackBefore = 10;
+			constexpr int kStackAfter  = 32;
+			const int     total = kStackBefore + kStackAfter;
+			if (IsReadableRange(info->rsp - kStackBefore * 8, total * 8)) {
+				const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+				std::printf("stack (rsp%+d .. rsp+%d):", -kStackBefore * 8, (kStackAfter - 1) * 8);
+				for (int i = -kStackBefore; i < kStackAfter; i++) {
+					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				}
+				std::printf("\n");
+				// Guest code addresses in the dumped words are likely return addresses.
+				for (int i = 0; i < kStackAfter; i++) {
+					std::string module;
+					uint64_t    module_offset = 0;
+					auto*       linker        = Common::Singleton<RuntimeLinker>::Instance();
+					if (linker->TryDescribeAddress(stack[i], &module, &module_offset)) {
+						std::printf("  stack+%02x %016" PRIx64 ": %s+0x%" PRIx64 "\n", i * 8,
+						            stack[i], module.c_str(), module_offset);
+					}
+				}
 			}
-			std::printf("\n");
-			// Guest code addresses in the dumped words are likely return addresses.
-			for (int i = 0; i < 32; i++) {
+		}
+		// How the callee obtained the destination base and the surface descriptor is visible only in
+		// the caller. Dump the bytes just before the first return addresses.
+		if (IsReadableRange(info->rsp, 6 * sizeof(uint64_t))) {
+			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			int         printed = 0;
+			for (int i = 0; i < 6 && printed < 2; i++) {
 				std::string module;
 				uint64_t    module_offset = 0;
 				auto*       linker        = Common::Singleton<RuntimeLinker>::Instance();
 				if (linker->TryDescribeAddress(stack[i], &module, &module_offset)) {
-					std::printf("  stack+%02x %016" PRIx64 ": %s+0x%" PRIx64 "\n", i * 8, stack[i],
-					            module.c_str(), module_offset);
+					PrintCodeWindow("caller", stack[i], 48, 16);
+					printed++;
 				}
 			}
 		}
