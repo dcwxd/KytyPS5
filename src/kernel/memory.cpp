@@ -3586,6 +3586,12 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		if (result != OK) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t [Fail] entry %d (start = 0x%016" PRIx64 ", len = 0x%016" PRIx64
+			           ", op = %d) returned 0x%08x\n",
+			           i, reinterpret_cast<uint64_t>(entry->start),
+			           static_cast<uint64_t>(entry->length), entry->operation,
+			           static_cast<uint32_t>(result));
 			if (num_entries_out != nullptr) {
 				*num_entries_out = processed;
 			}
