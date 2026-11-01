@@ -1231,7 +1231,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// Dumping below rsp shows the vector that produced the huge destination offsets.
 		{
 			constexpr int kStackBefore = 10;
-			constexpr int kStackAfter  = 32;
+			// The callee's return address sits 0x30 above rsp, so the caller's frame (its spilled
+			// parameters, the function it dispatched through and the surface it passed) starts
+			// there. Reaching only 0x100 words past rsp showed none of it.
+			constexpr int kStackAfter = 72;
 			const int     total = kStackBefore + kStackAfter;
 			if (IsReadableRange(info->rsp - kStackBefore * 8, total * 8)) {
 				const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
