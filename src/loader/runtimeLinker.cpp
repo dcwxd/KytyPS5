@@ -854,13 +854,26 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 		}
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+		// The 96-byte window used to stop just before the faulting store, which hid the loop
+		// preamble that computes the base register and its huge offsets. Reach back far enough to
+		// see the whole unrolled body and its setup.
+		{
+			constexpr int kCodeBefore = 256;
+			constexpr int kCodeAfter  = 64;
+			const bool    wide = IsReadableRange(info->exception_address - kCodeBefore,
+			                                     kCodeBefore + kCodeAfter);
+			const int     code_before = wide ? kCodeBefore : 48;
+			const int     total       = code_before + kCodeAfter;
+			if (IsReadableRange(info->exception_address - code_before, total)) {
+				const auto* code =
+				    reinterpret_cast<const uint8_t*>(info->exception_address - code_before);
+				std::printf("code (pc-%d .. pc+%d, fault at byte %d):", code_before, kCodeAfter,
+				            code_before);
+				for (int i = 0; i < total; i++) {
+					std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+				}
+				std::printf("\n");
 			}
-			std::printf("\n");
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);

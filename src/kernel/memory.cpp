@@ -1854,19 +1854,29 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	                                              GUEST_MAP_DMEM_COMPAT | GUEST_MAP_UNKNOWN_8000 |
 	                                              GUEST_MAP_NO_COALESCE | GUEST_MAP_ALIGNMENT_MASK;
 
+	// Rejected calls are only visible here: the caller sees an error, but the reason (size larger
+	// than the free pool, unsupported flags, unusable hint) never reaches the fault report.
+	const auto requested_addr =
+	    addr_in_out != nullptr ? reinterpret_cast<uint64_t>(*addr_in_out) : 0;
+	auto       fail           = [&](int error) {
+		RecordMemoryCall("map-flexible", requested_addr, len, 0, "flags",
+		                 static_cast<uint32_t>(flags), error);
+		return error;
+	};
+
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
-		return KERNEL_ERROR_EINVAL;
+		return fail(KERNEL_ERROR_EINVAL);
 	}
 	if (len > g_flexible_memory->Available()) {
-		return KERNEL_ERROR_ENOMEM;
+		return fail(KERNEL_ERROR_ENOMEM);
 	}
 
 	if (name == nullptr) {
-		return KERNEL_ERROR_EFAULT;
+		return fail(KERNEL_ERROR_EFAULT);
 	}
 
 	if (std::strlen(name) >= MAXIMUM_NAME_SIZE) {
-		return KERNEL_ERROR_ENAMETOOLONG;
+		return fail(KERNEL_ERROR_ENAMETOOLONG);
 	}
 
 	const auto map_flags       = static_cast<uint32_t>(flags);
@@ -1874,7 +1884,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	if ((map_flags & ~SUPPORTED_MAP_BITS) != 0 ||
 	    (alignment_shift != 0 && (alignment_shift < 14 || alignment_shift > 31))) {
 		LOGF_COLOR(Log::Color::Red, "\t unsupported flags = 0x%08" PRIx32 "\n", map_flags);
-		return KERNEL_ERROR_EINVAL;
+		return fail(KERNEL_ERROR_EINVAL);
 	}
 	const uint64_t map_alignment =
 	    alignment_shift != 0 ? uint64_t {1} << alignment_shift : PAGE_SIZE;
@@ -3703,6 +3713,8 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
 
 	if (!DecodeMemoryProtection(prot, &mode)) {
+		RecordMemoryCall("protect", aligned_addr, aligned_len, aligned_addr, "prot",
+		                 static_cast<uint32_t>(prot), KERNEL_ERROR_EINVAL);
 		return KERNEL_ERROR_EINVAL;
 	}
 	std::vector<VirtualRanges::Range> old_ranges;
@@ -3848,14 +3860,20 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	constexpr uint64_t POOL_PAGE_SIZE = 0x10000;
+	auto               fail           = [&](int error) {
+		RecordMemoryCall("pool-expand", static_cast<uint64_t>(search_start),
+		                 static_cast<uint64_t>(len), 0, "search_end",
+		                 static_cast<uint64_t>(search_end), error);
+		return error;
+	};
 	if (search_start < 0 || search_end <= search_start || len == 0 ||
 	    (len & (POOL_PAGE_SIZE - 1u)) != 0 || phys_addr_out == nullptr ||
 	    (alignment != 0 &&
 	     (!std::has_single_bit(alignment) || (alignment & (POOL_PAGE_SIZE - 1u)) != 0))) {
-		return KERNEL_ERROR_EINVAL;
+		return fail(KERNEL_ERROR_EINVAL);
 	}
 	if (static_cast<uint64_t>(search_end - search_start) < len) {
-		return KERNEL_ERROR_ENOMEM;
+		return fail(KERNEL_ERROR_ENOMEM);
 	}
 
 	const auto effective_alignment = (alignment != 0 ? alignment : POOL_PAGE_SIZE);
@@ -3863,11 +3881,14 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
 	if (!g_physical_memory->Alloc(static_cast<uint64_t>(search_start),
 	                              static_cast<uint64_t>(search_end), len, effective_alignment,
 	                              &phys_addr, 0, PhysicalMemory::AllocationKind::Pooled)) {
-		return KERNEL_ERROR_ENOMEM;
+		return fail(KERNEL_ERROR_ENOMEM);
 	}
 
 	g_pooled_memory->Expand(phys_addr, len);
 	*phys_addr_out = static_cast<int64_t>(phys_addr);
+	RecordMemoryCall("pool-expand", static_cast<uint64_t>(search_start),
+	                 static_cast<uint64_t>(len), phys_addr, "search_end",
+	                 static_cast<uint64_t>(search_end), OK);
 
 	LOGF("\t search_start = 0x%016" PRIx64 "\n"
 	     "\t search_end   = 0x%016" PRIx64 "\n"
@@ -3906,24 +3927,37 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 
 	void*      out_addr          = addr_in;
 	const auto reserve_alignment = (alignment != 0 ? alignment : POOL_RESERVE_ALIGNMENT);
+	const auto in_addr           = reinterpret_cast<uint64_t>(addr_in);
 	const int  ret = KernelReserveVirtualRange(&out_addr, len, flags, reserve_alignment);
+	int        result = ret;
 	if (ret == OK) {
 		const auto           out_vaddr = reinterpret_cast<uint64_t>(out_addr);
 		VirtualRanges::Range reserved_range {};
 		if (!g_virtual_ranges->Query(out_vaddr, 0, &reserved_range) ||
 		    reserved_range.start != out_vaddr || reserved_range.size != len ||
 		    !IsReservedRangeType(reserved_range.type)) {
-			return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
+			// The virtual-range table merges neighbouring reservations, so `Query` can come back
+			// with a range that starts earlier and is longer than this call. The reservation
+			// itself is fine; only the pool bookkeeping needs the exact span.
+			LOGF_COLOR(Log::Color::Red,
+			           "\t pool-reserve: range not isolated at 0x%016" PRIx64
+			           " (query start 0x%016" PRIx64 ", size 0x%016" PRIx64 ")\n",
+			           out_vaddr, reserved_range.start, reserved_range.size);
+			result = KERNEL_ERROR_EBUSY;
+		} else if (!g_virtual_ranges->ReplaceSpan(out_vaddr, len, VirtualRangeType::Reserved, 0,
+		                                         0, 0, VirtualRangeType::PoolReserved,
+		                                         reserved_range.name)) {
+			result = KERNEL_ERROR_EBUSY;
+		} else {
+			*addr_out = out_addr;
+			LOGF("\t out_addr  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(out_addr));
 		}
-		if (!g_virtual_ranges->ReplaceSpan(out_vaddr, len, VirtualRangeType::Reserved, 0, 0, 0,
-		                                   VirtualRangeType::PoolReserved, reserved_range.name)) {
-			return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
-		}
-		*addr_out = out_addr;
-		LOGF("\t out_addr  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(out_addr));
 	}
 
-	return LogMemoryApiFailure(__func__, ret);
+	RecordMemoryCall("pool-reserve", in_addr, len, reinterpret_cast<uint64_t>(out_addr), "flags",
+	                 static_cast<uint32_t>(flags), result);
+
+	return LogMemoryApiFailure(__func__, result);
 }
 
 int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags) {
@@ -3942,29 +3976,36 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	constexpr uint64_t POOL_COMMIT_ALIGNMENT = 0x10000;
 	constexpr int      PROT_CPU_EXEC         = 0x04;
 
+	const auto vaddr = reinterpret_cast<uint64_t>(addr);
+	// Every failure path is recorded: a commit that quietly fails leaves a pool reservation that
+	// the guest believes is usable, which is exactly the kind of thing the fault report needs.
+	auto fail = [&](int error) {
+		RecordMemoryCall("pool-commit", vaddr, len, vaddr, "prot", static_cast<uint32_t>(prot),
+		                 error);
+		return LogMemoryApiFailure(__func__, error);
+	};
+
 	if (addr == nullptr || len == 0 || !IsAligned(len, POOL_COMMIT_ALIGNMENT) ||
 	    (prot & PROT_CPU_EXEC) != 0) {
-		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
+		return fail(KERNEL_ERROR_EINVAL);
 	}
 
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
 
 	if (!DecodeMemoryProtection(prot, &mode)) {
-		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
+		return fail(KERNEL_ERROR_EINVAL);
 	}
-
-	const auto vaddr = reinterpret_cast<uint64_t>(addr);
 
 	VirtualRanges::Range old_range {};
 	if (!g_virtual_ranges->Query(vaddr, 0, &old_range) ||
 	    old_range.type != VirtualRangeType::PoolReserved ||
 	    len > old_range.size - (vaddr - old_range.start)) {
-		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EACCES);
+		return fail(KERNEL_ERROR_EACCES);
 	}
 
 	std::vector<PooledMemory::Mapping> mappings;
 	if (!g_pooled_memory->Allocate(vaddr, len, &mappings)) {
-		return LogMemoryApiFailure(__func__, KERNEL_ERROR_ENOMEM);
+		return fail(KERNEL_ERROR_ENOMEM);
 	}
 
 	size_t mapped_size = 0;
@@ -3985,7 +4026,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 			LOGF_COLOR(Log::Color::Red, "\t pool backing map failed: %s\n",
 			           GuestBackingStore::GetFailureReasonName(failure_reason));
 			rollback();
-			return LogMemoryApiFailure(__func__, KERNEL_ERROR_ENOMEM);
+			return fail(KERNEL_ERROR_ENOMEM);
 		}
 		mapped_size += mapping.size;
 	}
@@ -3993,9 +4034,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	if (!g_virtual_ranges->ReplaceSpan(vaddr, len, VirtualRangeType::PoolReserved, 0, prot, type,
 	                                   VirtualRangeType::Pooled, old_range.name)) {
 		rollback();
-		RecordMemoryCall("pool-commit", vaddr, len, vaddr, "prot", static_cast<uint32_t>(prot),
-		                 KERNEL_ERROR_EBUSY);
-		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
+		return fail(KERNEL_ERROR_EBUSY);
 	}
 
 	MapGpuRange(vaddr, len);
@@ -4024,19 +4063,25 @@ int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 
 	constexpr uint64_t POOL_COMMIT_ALIGNMENT = 0x10000;
 
+	const auto vaddr = reinterpret_cast<uint64_t>(addr);
+	auto fail = [&](int error) {
+		RecordMemoryCall("pool-decommit", vaddr, len, vaddr, "flags",
+		                 static_cast<uint32_t>(flags), error);
+		return error;
+	};
+
 	if (addr == nullptr || len == 0 || !IsAligned(len, POOL_COMMIT_ALIGNMENT)) {
-		return KERNEL_ERROR_EINVAL;
+		return fail(KERNEL_ERROR_EINVAL);
 	}
 
-	const auto vaddr = reinterpret_cast<uint64_t>(addr);
 	if (UINT64_MAX - vaddr < len) {
-		return KERNEL_ERROR_EINVAL;
+		return fail(KERNEL_ERROR_EINVAL);
 	}
 	std::vector<VirtualRanges::Range> ranges;
 	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges) ||
 	    std::any_of(ranges.begin(), ranges.end(),
 	                [](const auto& range) { return !IsPooledRangeType(range.type); })) {
-		return KERNEL_ERROR_EACCES;
+		return fail(KERNEL_ERROR_EACCES);
 	}
 
 	UnmapGpuRange(vaddr, len);
@@ -4048,6 +4093,8 @@ int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 			     range.start, range.size);
 		}
 	}
+	RecordMemoryCall("pool-decommit", vaddr, len, vaddr, "flags", static_cast<uint32_t>(flags),
+	                 OK);
 	return OK;
 }
 
