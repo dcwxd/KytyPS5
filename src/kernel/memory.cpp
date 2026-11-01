@@ -4023,19 +4023,18 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 		const auto           out_vaddr = reinterpret_cast<uint64_t>(out_addr);
 		VirtualRanges::Range reserved_range {};
 		if (!g_virtual_ranges->Query(out_vaddr, 0, &reserved_range) ||
-		    reserved_range.start != out_vaddr || reserved_range.size != len ||
-		    !IsReservedRangeType(reserved_range.type)) {
-			// The virtual-range table merges neighbouring reservations, so `Query` can come back
-			// with a range that starts earlier and is longer than this call. The reservation
-			// itself is fine; only the pool bookkeeping needs the exact span.
+		    !IsReservedRangeType(reserved_range.type) ||
+		    // The range table coalesces neighbouring reservations, so the query above can
+		    // report a span that starts earlier or ends later than this call. ReplaceSpan()
+		    // splits at both ends first, so asking it to convert exactly this span is both the
+		    // validation and the split the pool bookkeeping needs.
+		    !g_virtual_ranges->ReplaceSpan(out_vaddr, len, VirtualRangeType::Reserved, 0, 0, 0,
+		                                   VirtualRangeType::PoolReserved, reserved_range.name)) {
 			LOGF_COLOR(Log::Color::Red,
-			           "\t pool-reserve: range not isolated at 0x%016" PRIx64
+			           "\t pool-reserve: cannot convert 0x%016" PRIx64 ", size=0x%016" PRIx64
 			           " (query start 0x%016" PRIx64 ", size 0x%016" PRIx64 ")\n",
-			           out_vaddr, reserved_range.start, reserved_range.size);
-			result = KERNEL_ERROR_EBUSY;
-		} else if (!g_virtual_ranges->ReplaceSpan(out_vaddr, len, VirtualRangeType::Reserved, 0,
-		                                         0, 0, VirtualRangeType::PoolReserved,
-		                                         reserved_range.name)) {
+			           out_vaddr, static_cast<uint64_t>(len), reserved_range.start,
+			           reserved_range.size);
 			result = KERNEL_ERROR_EBUSY;
 		} else {
 			*addr_out = out_addr;

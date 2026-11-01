@@ -6031,6 +6031,50 @@ void TestRecentRangeChanges() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestPoolReserveAmidMergedReservations() {
+	const char* test = "PoolReserveAmidMergedReservations";
+
+	// Reservations coalesce, so a pool reserve that lands next to one sees a longer range in the
+	// table. It must still succeed: rejecting it leaves the guest with a reservation it asked for
+	// but that no commit can ever use.
+	constexpr uint64_t block = 0x200000;
+	constexpr uint64_t arena = 0x7600000000ull;
+
+	void* first = reinterpret_cast<void*>(arena);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&first, block * 2, SceKernelMapFixed,
+	                                                           block),
+	        "KernelReserveVirtualRange(two blocks)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(arena, block), "KernelMunmap(lower block)");
+
+	// Prove the precondition: a hint-less reserve of the freed lower block coalesces with the
+	// upper one, so the table reports a range twice the size of the request.
+	void* probe = reinterpret_cast<void*>(arena);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&probe, block, 0, block),
+	        "KernelReserveVirtualRange(merging probe)");
+	ExpectRange(test, Query(test, arena), arena, arena + block * 2, 0, 0, 0, 0, 0, nullptr, 0);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(arena, block), "KernelMunmap(probe)");
+
+	// The hint picks the freshly freed lower block, so the new reservation coalesces with the
+	// upper block that is still reserved.
+	void* pool = reinterpret_cast<void*>(arena);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolReserve(reinterpret_cast<void*>(arena), block, 0,
+	                                                         0, &pool),
+	        "KernelMemoryPoolReserve(adjacent to a merged reservation)");
+	Check(test, pool == reinterpret_cast<void*>(arena), "pool reserve moved the hinted address");
+
+	ExpectRange(test, Query(test, arena), arena, arena + block, 0, 0, 0, 1, 0, nullptr, 0);
+	ExpectRange(test, Query(test, arena + block), arena + block, arena + block * 2, 0, 0, 0, 0, 0,
+	            nullptr, 0);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(arena, block * 2),
+	        "KernelMunmap(pool reserve cleanup)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
@@ -6212,6 +6256,7 @@ int main(int argc, char** argv) {
 	RunTest(TestAutomaticMemoryReuseAndAliases);
 	RunTest(TestAutomaticMemoryFragmentedMapRollback);
 	RunTest(TestMemoryPoolAlignmentContracts);
+	RunTest(TestPoolReserveAmidMergedReservations);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);
 	RunTest(TestMemoryPoolMiddleDecommitAndReuse);
