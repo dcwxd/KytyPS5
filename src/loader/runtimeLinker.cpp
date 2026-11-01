@@ -722,16 +722,50 @@ static void PrintMemoryCalls(const char* title, const Libs::LibKernel::Memory::G
 	}
 }
 
-static void PrintRecentMemoryCalls(uint64_t focus) {
-	// Enough to show a sequence, small enough that the report stays readable. The large-call ring
-	// below is the one that keeps the address-space-defining calls for the whole session, so its
-	// beginning is printed as well as its end.
-	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 64> calls {};
-	uint64_t                                                 total = 0;
+// The long-lived rings keep every big call of the session, so sampling their ends hides the one
+// reservation that mattered. Print everything above the size of interest, plus the calls the fault
+// itself points at.
+static void PrintFilteredMemoryCalls(const char* title,
+                                     const Libs::LibKernel::Memory::GuestMemoryCall* calls,
+                                     unsigned count, uint64_t total, uint64_t focus,
+                                     uint64_t min_size) {
+	if (count == 0) {
+		return;
+	}
+	std::printf("--- %s (only calls with len >= 0x%" PRIx64 " bytes, oldest first%s) ---\n", title,
+	            min_size, total > count ? ", older ones dropped" : "");
+	unsigned shown = 0;
+	for (unsigned i = 0; i < count; i++) {
+		const auto& call = calls[i];
+		const bool covers = focus != 0 && call.out_addr != 0 && focus >= call.out_addr &&
+		                    (call.len == 0 || focus - call.out_addr < call.len);
+		if (!covers && call.len < min_size) {
+			continue;
+		}
+		PrintMemoryCall(call, focus);
+		shown++;
+	}
+	if (shown == 0) {
+		std::printf("  (none)\n");
+	}
+}
 
-	auto count = Libs::LibKernel::Memory::GetRecentLargeMemoryCalls(calls.data(), calls.size(),
-	                                                               &total);
-	PrintMemoryCalls("large memory calls (>= 4 MiB)", calls.data(), count, total, focus, 24, 24);
+static void PrintRecentMemoryCalls(uint64_t focus) {
+	// Enough to show a sequence, small enough that the report stays readable. The rings below keep
+	// the address-space-defining calls for the whole session, so their beginnings are printed too.
+	std::array<Libs::LibKernel::Memory::GuestMemoryCall, 512> calls {};
+	uint64_t                                                  total = 0;
+
+	// A failing call is the most likely reason the guest keeps using memory it never got.
+	auto count = Libs::LibKernel::Memory::GetRecentFailedMemoryCalls(calls.data(), calls.size(),
+	                                                                &total);
+	PrintMemoryCalls("failed memory calls", calls.data(), count, total, focus, 24, 32);
+
+	count = Libs::LibKernel::Memory::GetRecentHugeMemoryCalls(calls.data(), calls.size(), &total);
+	PrintFilteredMemoryCalls("huge memory calls", calls.data(), count, total, focus, 0x40000000);
+
+	count = Libs::LibKernel::Memory::GetRecentLargeMemoryCalls(calls.data(), calls.size(), &total);
+	PrintFilteredMemoryCalls("large memory calls", calls.data(), count, total, focus, 0x4000000);
 
 	count = Libs::LibKernel::Memory::GetRecentNotableMemoryCalls(calls.data(), calls.size(),
 	                                                            &total);
@@ -748,6 +782,29 @@ static void PrintRangeChange(const Libs::LibKernel::Memory::GuestRangeChange& ch
 	std::printf("%-7s %-9s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64 "\n",
 	            change.op, change.kind, change.name, change.start, change.start + change.size,
 	            change.size);
+}
+
+// A long-lived ring answers "was this range ever laid out differently?" only if the entries that
+// matter are shown wherever they sit in it, so filter by size instead of sampling the ends.
+static void PrintFilteredRangeChanges(const char* title,
+                                      const Libs::LibKernel::Memory::GuestRangeChange* changes,
+                                      unsigned count, uint64_t total, uint64_t min_size) {
+	if (count == 0) {
+		return;
+	}
+	std::printf("--- %s (only ranges >= 0x%" PRIx64 " bytes, oldest first%s) ---\n", title,
+	            min_size, total > count ? ", older ones dropped" : "");
+	unsigned shown = 0;
+	for (unsigned i = 0; i < count; i++) {
+		if (changes[i].size < min_size) {
+			continue;
+		}
+		PrintRangeChange(changes[i]);
+		shown++;
+	}
+	if (shown == 0) {
+		std::printf("  (none)\n");
+	}
 }
 
 static void PrintRangeChanges(const char* title,
@@ -776,15 +833,19 @@ static void PrintRangeChanges(const char* title,
 }
 
 static void PrintRecentRangeChanges() {
-	std::array<Libs::LibKernel::Memory::GuestRangeChange, 96> changes {};
-	uint64_t                                                  total = 0;
+	// The huge and large rings are never flushed by the 64 KiB churn, so they still show how the
+	// big reservations came about even after the general ring has rolled over many times. Their
+	// interesting entries are not necessarily at either end, so print them filtered by size.
+	std::array<Libs::LibKernel::Memory::GuestRangeChange, 512> changes {};
+	uint64_t                                                   total = 0;
 
-	// The large ring is never flushed by the 64 KiB churn, so it still shows how the big
-	// reservations came about even after the general ring has rolled over many times. Both of its
-	// ends matter: the huge reservations are usually the oldest surviving entries.
-	auto count = Libs::LibKernel::Memory::GetRecentLargeRangeChanges(changes.data(),
-	                                                                changes.size(), &total);
-	PrintRangeChanges("large guest range changes (>= 4 MiB)", changes.data(), count, total, 32, 32);
+	auto count = Libs::LibKernel::Memory::GetRecentHugeRangeChanges(changes.data(),
+	                                                              changes.size(), &total);
+	PrintFilteredRangeChanges("huge guest range changes", changes.data(), count, total, 0x40000000);
+
+	count = Libs::LibKernel::Memory::GetRecentLargeRangeChanges(changes.data(), changes.size(),
+	                                                            &total);
+	PrintFilteredRangeChanges("large guest range changes", changes.data(), count, total, 0x4000000);
 
 	count = Libs::LibKernel::Memory::GetRecentRangeChanges(changes.data(), changes.size(), &total);
 	PrintRangeChanges("recent guest range changes", changes.data(), count, total, 0, 24);
@@ -966,17 +1027,23 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		// How the callee obtained the destination base and the surface descriptor is visible only in
-		// the caller. Dump the bytes just before the first return addresses.
-		if (IsReadableRange(info->rsp, 6 * sizeof(uint64_t))) {
-			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			int         printed = 0;
-			for (int i = 0; i < 6 && printed < 2; i++) {
-				std::string module;
-				uint64_t    module_offset = 0;
-				auto*       linker        = Common::Singleton<RuntimeLinker>::Instance();
-				if (linker->TryDescribeAddress(stack[i], &module, &module_offset)) {
-					PrintCodeWindow("caller", stack[i], 48, 16);
-					printed++;
+		// the caller. The return address is not the first stack word: the callee spills its own
+		// locals first, so scan a few frames' worth of words.
+		{
+			constexpr int kScanWords = 24;
+			if (IsReadableRange(info->rsp, kScanWords * sizeof(uint64_t))) {
+				const auto* stack   = reinterpret_cast<const uint64_t*>(info->rsp);
+				int         printed = 0;
+				for (int i = 0; i < kScanWords && printed < 2; i++) {
+					std::string module;
+					uint64_t    module_offset = 0;
+					auto*       linker        = Common::Singleton<RuntimeLinker>::Instance();
+					if (linker->TryDescribeAddress(stack[i], &module, &module_offset)) {
+						std::printf("code of return address stack+%02x (%s+0x%" PRIx64 "):\n",
+						            i * 8, module.c_str(), module_offset);
+						PrintCodeWindow("caller", stack[i], 48, 16);
+						printed++;
+					}
 				}
 			}
 		}

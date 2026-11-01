@@ -5972,6 +5972,58 @@ void TestRecentRangeChanges() {
 	Check(test, large_change_count != 0 && large_change_total >= large_change_count,
 	      "the large-change ring did not record the multi-megabyte reservation");
 
+	// The huge rings exist for the address-space-defining reservations; without them a single
+	// gigabyte-sized mapping is gone from every other ring by the time a buffer faults.
+	constexpr uint64_t huge_length = 0x40000000;
+	void*              huge        = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&huge, huge_length, 0, huge_length),
+	        "KernelReserveVirtualRange(huge)");
+
+	uint64_t   huge_call_total = 0;
+	const auto huge_call_count =
+	    Libs::LibKernel::Memory::GetRecentHugeMemoryCalls(calls.data(), calls.size(), &huge_call_total);
+	bool found_huge = false;
+	for (unsigned i = 0; i < huge_call_count; i++) {
+		if (calls[i].len == huge_length && calls[i].out_addr == reinterpret_cast<uint64_t>(huge)) {
+			found_huge = true;
+		}
+	}
+	Check(test, found_huge, "the huge-call ring did not record a gigabyte-sized reservation");
+
+	uint64_t   huge_change_total = 0;
+	const auto huge_change_count =
+	    Libs::LibKernel::Memory::GetRecentHugeRangeChanges(changes.data(), changes.size(),
+	                                                       &huge_change_total);
+	found_huge = false;
+	for (unsigned i = 0; i < huge_change_count; i++) {
+		if (changes[i].start == reinterpret_cast<uint64_t>(huge) &&
+		    changes[i].size == huge_length) {
+			found_huge = true;
+		}
+	}
+	Check(test, found_huge, "the huge-change ring did not record a gigabyte-sized reservation");
+
+	// A failing call is exactly what the guest is most likely to keep using, so it gets its own
+	// ring: committing a plain reservation as pool memory must fail and still be remembered.
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(huge, SceKernelPageSize, SceKernelMtypeC,
+	                                                      SceKernelProtCpuRw, 0) != 0,
+	      "KernelMemoryPoolCommit on a plain reservation unexpectedly succeeded");
+	uint64_t   failed_total = 0;
+	const auto failed_count =
+	    Libs::LibKernel::Memory::GetRecentFailedMemoryCalls(calls.data(), calls.size(), &failed_total);
+	bool found_failed = false;
+	for (unsigned i = 0; i < failed_count; i++) {
+		if (std::strcmp(calls[i].api, "pool-commit") == 0 && calls[i].result != 0) {
+			found_failed = true;
+		}
+	}
+	Check(test, found_failed, "the failed-call ring did not record a rejected commit");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(huge), huge_length),
+	        "KernelMunmap(huge)");
+
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(big), big_length),
 	        "KernelMunmap(large)");

@@ -182,6 +182,9 @@ unsigned GetRecentRangeChanges(GuestRangeChange* out, unsigned capacity,
 // Only changes of 4 MiB or more, kept apart from the 64 KiB churn above.
 unsigned GetRecentLargeRangeChanges(GuestRangeChange* out, unsigned capacity,
                                     uint64_t* total) noexcept;
+// Only changes of 1 GiB or more: the reservations that define the whole address space.
+unsigned GetRecentHugeRangeChanges(GuestRangeChange* out, unsigned capacity,
+                                   uint64_t* total) noexcept;
 
 // The same idea for memory API calls: the request the guest made and the address we returned.
 struct GuestMemoryCall {
@@ -204,6 +207,14 @@ unsigned GetRecentNotableMemoryCalls(GuestMemoryCall* out, unsigned capacity,
 // whole session instead of being pushed out by the 64 KiB allocator.
 unsigned GetRecentLargeMemoryCalls(GuestMemoryCall* out, unsigned capacity,
                                    uint64_t* total) noexcept;
+// Calls of 1 GiB or more. A guest that reserves most of its address space does it once, early, and
+// every other ring has forgotten it by the time an asset buffer faults.
+unsigned GetRecentHugeMemoryCalls(GuestMemoryCall* out, unsigned capacity,
+                                  uint64_t* total) noexcept;
+// Calls that returned an error. A single failed mapping leaves the guest with a pointer it keeps
+// using, and the general rings have long rolled over by the time that pointer faults.
+unsigned GetRecentFailedMemoryCalls(GuestMemoryCall* out, unsigned capacity,
+                                    uint64_t* total) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

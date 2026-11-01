@@ -252,9 +252,16 @@ std::atomic<uint64_t> g_range_change_sequence {0};
 // Range changes for the big players: the guest's 64 KiB churn fills the ring above within a
 // second, so a reservation of tens of gigabytes has to be remembered separately.
 constexpr uint64_t kLargeRangeMinimum     = 0x400000;
-constexpr unsigned kLargeRangeChangeCount = 128;
+constexpr unsigned kLargeRangeChangeCount = 512;
 RangeChange           g_large_range_changes[kLargeRangeChangeCount];
 std::atomic<uint64_t> g_large_range_change_sequence {0};
+
+// The address-space-defining reservations are gigabyte-sized and happen once; nothing else may
+// push them out of the report.
+constexpr uint64_t kHugeRangeMinimum     = 0x40000000;
+constexpr unsigned kHugeRangeChangeCount = 32;
+RangeChange           g_huge_range_changes[kHugeRangeChangeCount];
+std::atomic<uint64_t> g_huge_range_change_sequence {0};
 
 // Writers run under the range-table mutex, so they never race each other. The crash reader runs
 // on the faulting thread without any lock, hence the per-entry seqlock.
@@ -277,6 +284,12 @@ static void RecordRangeChange(const char* op, uint64_t start, uint64_t size,
 		const uint64_t large_number =
 		    g_large_range_change_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 		fill(g_large_range_changes[(large_number - 1) % kLargeRangeChangeCount], large_number);
+	}
+
+	if (size >= kHugeRangeMinimum) {
+		const uint64_t huge_number =
+		    g_huge_range_change_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+		fill(g_huge_range_changes[(huge_number - 1) % kHugeRangeChangeCount], huge_number);
 	}
 }
 
@@ -312,9 +325,22 @@ std::atomic<uint64_t> g_notable_call_sequence {0};
 // handful of calls that stake out the address space: a multi-hundred-gigabyte reservation made
 // early in the run is long gone by the time an asset buffer faults. Keep those separately.
 constexpr uint64_t    kLargeCallMinimum = 0x400000;
-constexpr unsigned    kLargeCallCount   = 128;
+constexpr unsigned    kLargeCallCount   = 512;
 MemoryCall            g_large_calls[kLargeCallCount];
 std::atomic<uint64_t> g_large_call_sequence {0};
+
+// Gigabyte-sized requests: the reserve that stakes out the guest's address space, and the pool
+// expansions that follow. They happen once or twice per session, so they must survive verbatim.
+constexpr uint64_t    kHugeCallMinimum = 0x40000000;
+constexpr unsigned    kHugeCallCount   = 32;
+MemoryCall            g_huge_calls[kHugeCallCount];
+std::atomic<uint64_t> g_huge_call_sequence {0};
+
+// Failures are the one thing no amount of churn should be allowed to hide: the guest keeps using
+// whatever a failing call left in its pointer even when the address space never got the range.
+constexpr unsigned    kFailedCallCount = 96;
+MemoryCall            g_failed_calls[kFailedCallCount];
+std::atomic<uint64_t> g_failed_call_sequence {0};
 
 // Same contract as RecordRangeChange(): writers hold the memory mutex, the crash reader does not.
 static void RecordMemoryCall(const char* api, uint64_t in_addr, uint64_t len, uint64_t out_addr,
@@ -346,6 +372,18 @@ static void RecordMemoryCall(const char* api, uint64_t in_addr, uint64_t len, ui
 		const uint64_t large_number =
 		    g_large_call_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 		fill(g_large_calls[(large_number - 1) % kLargeCallCount], large_number);
+	}
+
+	if (len >= kHugeCallMinimum) {
+		const uint64_t huge_number =
+		    g_huge_call_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+		fill(g_huge_calls[(huge_number - 1) % kHugeCallCount], huge_number);
+	}
+
+	if (result != OK) {
+		const uint64_t failed_number =
+		    g_failed_call_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+		fill(g_failed_calls[(failed_number - 1) % kFailedCallCount], failed_number);
 	}
 }
 
@@ -3513,6 +3551,10 @@ unsigned GetRecentLargeRangeChanges(GuestRangeChange* out, unsigned capacity,
 	return ReadRangeRing(g_large_range_changes, g_large_range_change_sequence, out, capacity,
 	                     total);
 }
+unsigned GetRecentHugeRangeChanges(GuestRangeChange* out, unsigned capacity,
+                                   uint64_t* total) noexcept {
+	return ReadRangeRing(g_huge_range_changes, g_huge_range_change_sequence, out, capacity, total);
+}
 
 unsigned GetRecentMemoryCalls(GuestMemoryCall* out, unsigned capacity, uint64_t* total) noexcept {
 	return ReadCallRing(g_memory_calls, g_memory_call_sequence, out, capacity, total);
@@ -3525,6 +3567,14 @@ unsigned GetRecentNotableMemoryCalls(GuestMemoryCall* out, unsigned capacity,
 unsigned GetRecentLargeMemoryCalls(GuestMemoryCall* out, unsigned capacity,
                                    uint64_t* total) noexcept {
 	return ReadCallRing(g_large_calls, g_large_call_sequence, out, capacity, total);
+}
+unsigned GetRecentHugeMemoryCalls(GuestMemoryCall* out, unsigned capacity,
+                                  uint64_t* total) noexcept {
+	return ReadCallRing(g_huge_calls, g_huge_call_sequence, out, capacity, total);
+}
+unsigned GetRecentFailedMemoryCalls(GuestMemoryCall* out, unsigned capacity,
+                                    uint64_t* total) noexcept {
+	return ReadCallRing(g_failed_calls, g_failed_call_sequence, out, capacity, total);
 }
 
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
