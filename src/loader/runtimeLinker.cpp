@@ -650,6 +650,45 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Reports module+offset and the nearest guest mapping for a value that should be an address.
+static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
+	std::string module;
+	uint64_t    module_offset = 0;
+	auto*       linker        = Common::Singleton<RuntimeLinker>::Instance();
+	const bool  in_module     = linker->TryDescribeAddress(vaddr, &module, &module_offset);
+
+	Libs::LibKernel::Memory::GuestAddressInfo mapping {};
+	const bool mapped = Libs::LibKernel::Memory::DescribeGuestAddress(vaddr, &mapping);
+
+	std::printf("%-5s %016" PRIx64 ": ", label, vaddr);
+	if (in_module) {
+		std::printf("%s+0x%" PRIx64, module.c_str(), module_offset);
+	} else {
+		std::printf("(no loaded module)");
+	}
+	if (!mapped) {
+		std::printf(", %s\n", mapping.busy ? "mapping table busy" : "mapping unavailable");
+		return;
+	}
+	if (mapping.contains) {
+		std::printf(", in %s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64 "\n",
+		            mapping.kind, mapping.name, mapping.start, mapping.end,
+		            mapping.end - mapping.start);
+		return;
+	}
+	if (mapping.start != 0) {
+		std::printf(", 0x%" PRIx64 " bytes past the end of %s \"%s\" [%016" PRIx64
+		            "..%016" PRIx64 ")",
+		            vaddr - mapping.end, mapping.kind, mapping.name, mapping.start, mapping.end);
+		if (mapping.next_start != 0) {
+			std::printf(", next mapping 0x%" PRIx64, mapping.next_start);
+		}
+		std::printf("\n");
+		return;
+	}
+	std::printf(", below the first guest mapping 0x%" PRIx64 "\n", mapping.next_start);
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -690,6 +729,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+		PrintGuestAddressInfo("pc", info->exception_address);
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			PrintGuestAddressInfo("fault", info->access_violation_vaddr);
+		}
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -712,6 +755,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			std::printf("\n");
+			// Guest code addresses in the dumped words are likely return addresses.
+			for (int i = 0; i < 32; i++) {
+				std::string module;
+				uint64_t    module_offset = 0;
+				auto*       linker        = Common::Singleton<RuntimeLinker>::Instance();
+				if (linker->TryDescribeAddress(stack[i], &module, &module_offset)) {
+					std::printf("  stack+%02x %016" PRIx64 ": %s+0x%" PRIx64 "\n", i * 8, stack[i],
+					            module.c_str(), module_offset);
+				}
+			}
 		}
 		std::fflush(stdout);
 	}
@@ -1517,6 +1570,44 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	}
 
 	return nullptr;
+}
+
+bool RuntimeLinker::TryDescribeAddress(uint64_t vaddr, std::string* module, uint64_t* offset) {
+	if (module == nullptr || offset == nullptr || !m_mutex.TryLock()) {
+		return false;
+	}
+
+	Program* found = nullptr;
+	for (auto* p: m_programs) {
+		const auto* ehdr = (p == nullptr || p->elf == nullptr) ? nullptr : p->elf->GetEhdr();
+		const auto* phdr = (p == nullptr || p->elf == nullptr) ? nullptr : p->elf->GetPhdr();
+		if (phdr == nullptr || ehdr == nullptr) {
+			continue; // EXIT_IF() would terminate the crash reporter it is running in.
+		}
+
+		for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+			if (phdr[i].p_memsz != 0 &&
+			    (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
+				const uint64_t segment_addr = phdr[i].p_vaddr + p->base_vaddr;
+				const uint64_t segment_size = GetAlignedSize(phdr + i);
+				if (vaddr >= segment_addr && vaddr < segment_addr + segment_size) {
+					found = p;
+					break;
+				}
+			}
+		}
+		if (found != nullptr) {
+			break;
+		}
+	}
+
+	if (found != nullptr) {
+		*module = Common::FilenameWithoutDirectory(Common::PathToGenericString(found->file_name));
+		*offset = vaddr - found->base_vaddr;
+	}
+
+	m_mutex.Unlock();
+	return found != nullptr;
 }
 
 void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {

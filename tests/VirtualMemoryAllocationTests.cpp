@@ -5802,6 +5802,58 @@ void TestTlsStubsPreserveFlags() {
 
 int RunTrinityTests();
 
+// The fatal-exception report leans on these two helpers to say where a guest address lives.
+void TestDescribeGuestAddressAroundFault() {
+	const char* test = "DescribeGuestAddressAroundFault";
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            SceKernelPageSize * 4, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	constexpr uint64_t length = SceKernelPageSize * 4;
+	void*              addr   = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &addr, length, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize, "fault_probe"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+
+	Libs::LibKernel::Memory::GuestAddressInfo info {};
+	Check(test, Libs::LibKernel::Memory::DescribeGuestAddress(base + 0x40, &info),
+	      "DescribeGuestAddress should resolve a mapped address");
+	Check(test,
+	      info.contains && info.start == base && info.end == base + length &&
+	          std::strcmp(info.name, "fault_probe") == 0 && std::strcmp(info.kind, "direct") == 0,
+	      "DescribeGuestAddress reported the wrong containing range");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle page)");
+
+	// A fault in the hole must report the range before it, its distance and the next range.
+	const auto probe = base + SceKernelPageSize;
+	info             = {};
+	Check(test, Libs::LibKernel::Memory::DescribeGuestAddress(probe, &info),
+	      "DescribeGuestAddress should describe an unmapped address");
+	Check(test,
+	      !info.contains && info.start == base && info.end == probe &&
+	          info.next_start == probe + SceKernelPageSize,
+	      "DescribeGuestAddress reported the wrong neighbours for an unmapped address");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(probe + SceKernelPageSize,
+	                                              SceKernelPageSize * 2),
+	        "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, length),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
@@ -5946,6 +5998,7 @@ int main(int argc, char** argv) {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+	RunTest(TestDescribeGuestAddressAroundFault);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);

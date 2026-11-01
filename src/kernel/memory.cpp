@@ -208,6 +208,21 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 	       type == VirtualRangeType::Runtime;
 }
 
+// Used only by the fatal-exception report, never on a hot path.
+static const char* VirtualRangeTypeName(VirtualRangeType type) {
+	switch (type) {
+		case VirtualRangeType::Reserved: return "reserved";
+		case VirtualRangeType::PoolReserved: return "pool-reserved";
+		case VirtualRangeType::Direct: return "direct";
+		case VirtualRangeType::Flexible: return "flexible";
+		case VirtualRangeType::Pooled: return "pooled";
+		case VirtualRangeType::Stack: return "stack";
+		case VirtualRangeType::Code: return "code";
+		case VirtualRangeType::Runtime: return "runtime";
+	}
+	return "unknown";
+}
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static bool g_test_fail_next_range_replace = false;
 #endif
@@ -381,6 +396,34 @@ public:
 
 		*out = next->second;
 		return true;
+	}
+
+	// Fatal-report query: the range containing addr, or the nearest one below it, plus the
+	// first range that starts above addr. Bails out instead of waiting for the table lock.
+	bool TryQueryNearest(uint64_t addr, Range* nearest, bool* contains, uint64_t* next_start,
+	                     bool* busy) {
+		EXIT_IF(nearest == nullptr || contains == nullptr || next_start == nullptr ||
+		        busy == nullptr);
+
+		*busy = false;
+		if (!m_mutex.TryLock()) {
+			*busy = true;
+			return false;
+		}
+
+		auto next = m_ranges.upper_bound(addr);
+		*next_start = (next == m_ranges.end() ? 0 : next->first);
+		*contains   = false;
+		bool found  = false;
+		if (next != m_ranges.begin()) {
+			const auto& current = std::prev(next)->second;
+			*nearest  = current;
+			*contains = addr < End(current.start, current.size);
+			found     = true;
+		}
+
+		m_mutex.Unlock();
+		return found;
 	}
 
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
@@ -3107,6 +3150,40 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 	}
 
 	return OK;
+}
+
+bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept {
+	if (info == nullptr) {
+		return false;
+	}
+
+	auto* ranges = g_virtual_ranges.get();
+	if (ranges == nullptr) {
+		return false;
+	}
+
+	// A fault can land inside the memory subsystem itself, so never wait for these locks.
+	if (!g_memory_operation_mutex.try_lock()) {
+		info->busy = true;
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex,
+	                                                           std::adopt_lock);
+
+	VirtualRanges::Range nearest {};
+	bool                 contains   = false;
+	uint64_t             next_start = 0;
+	bool                 busy       = false;
+	if (ranges->TryQueryNearest(addr, &nearest, &contains, &next_start, &busy)) {
+		info->start  = nearest.start;
+		info->end    = nearest.start + nearest.size;
+		info->kind   = VirtualRangeTypeName(nearest.type);
+		CopyVirtualRangeName(info->name, nearest.name);
+	}
+	info->busy       = busy;
+	info->contains   = contains;
+	info->next_start = next_start;
+	return contains || info->start != 0 || next_start != 0;
 }
 
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {

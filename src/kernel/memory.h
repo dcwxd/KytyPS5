@@ -141,6 +141,20 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
+// Crash-report helper: describes the guest mapping around an address. It never waits on a lock
+// another thread may be holding, so the fatal-exception reporter cannot deadlock on it.
+// Returns false when the memory subsystem is not initialized or the range table is busy.
+struct GuestAddressInfo {
+	bool        busy       = false; // The range table lock was held; nothing else is valid.
+	bool        contains   = false; // addr lies inside [start, end).
+	uint64_t    start      = 0;     // The containing range, or the nearest range below addr.
+	uint64_t    end        = 0;
+	uint64_t    next_start = 0;     // First range above addr, 0 when there is none.
+	const char* kind       = "unknown";
+	char        name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
+};
+[[nodiscard]] bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept;
+
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags);

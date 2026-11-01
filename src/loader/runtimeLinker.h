@@ -180,6 +180,10 @@ public:
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
 
+	// Crash-report helper: like FindProgramByAddr(), but bails out instead of waiting for a
+	// concurrent linker update. Reports the module file name and the offset inside it.
+	[[nodiscard]] bool TryDescribeAddress(uint64_t vaddr, std::string* module, uint64_t* offset);
+
 	static uint8_t* TlsGetAddr(Program* program);
 	static void     DeleteTls(Program* program, int thread_id);
 
