@@ -5828,6 +5828,27 @@ void TestDescribeGuestAddressAroundFault() {
 	      info.contains && info.start == base && info.end == base + length &&
 	          std::strcmp(info.name, "fault_probe") == 0 && std::strcmp(info.kind, "direct") == 0,
 	      "DescribeGuestAddress reported the wrong containing range");
+	Check(test, info.contains_committed && info.committed_start == base &&
+	                info.committed_end == base + length,
+	      "DescribeGuestAddress did not report a mapped range as committed");
+
+	// Reserved address space is only booked, never backed. A fault inside it must be reported
+	// together with the last range that actually has memory behind it.
+	void* reserved = reinterpret_cast<void*>(base + length);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserved, length, SceKernelMapFixed,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	Check(test, reinterpret_cast<uint64_t>(reserved) == base + length,
+	      "fixed reservation did not land above the direct mapping");
+
+	info = {};
+	Check(test, Libs::LibKernel::Memory::DescribeGuestAddress(base + length + 0x40, &info),
+	      "DescribeGuestAddress should describe a reserved address");
+	Check(test,
+	      info.contains && std::strcmp(info.kind, "reserved") == 0 && !info.contains_committed &&
+	          info.committed_start == base && info.committed_end == base + length,
+	      "DescribeGuestAddress reported a reservation as a mapping");
 
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
@@ -5842,6 +5863,12 @@ void TestDescribeGuestAddressAroundFault() {
 	      !info.contains && info.start == base && info.end == probe &&
 	          info.next_start == probe + SceKernelPageSize,
 	      "DescribeGuestAddress reported the wrong neighbours for an unmapped address");
+	Check(test, !info.contains_committed && info.committed_start == base &&
+	                info.committed_end == probe,
+	      "DescribeGuestAddress reported the wrong mapped neighbour for a hole");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + length, length),
+	        "KernelMunmap(reserved)");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
 	CheckOk(test,

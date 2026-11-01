@@ -223,6 +223,16 @@ static const char* VirtualRangeTypeName(VirtualRangeType type) {
 	return "unknown";
 }
 
+// Crash diagnostics: guests routinely ignore a failing memory call and fault much later
+// somewhere unrelated, so make the failure itself visible while it still has a name.
+static int LogMemoryApiFailure(const char* api, int result) {
+	if (result != OK) {
+		LOGF_COLOR(Log::Color::Red, "\t [Fail] %s returned 0x%08x\n", api,
+		           static_cast<uint32_t>(result));
+	}
+	return result;
+}
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static bool g_test_fail_next_range_replace = false;
 #endif
@@ -420,6 +430,44 @@ public:
 			*nearest  = current;
 			*contains = addr < End(current.start, current.size);
 			found     = true;
+		}
+
+		m_mutex.Unlock();
+		return found;
+	}
+
+	// Fatal-report query: like TryQueryNearest(), but skips reserved placeholders so the caller
+	// learns which range is actually backed by memory.
+	bool TryQueryNearestCommitted(uint64_t addr, Range* nearest, bool* contains,
+	                              uint64_t* next_start, bool* busy) {
+		EXIT_IF(nearest == nullptr || contains == nullptr || next_start == nullptr ||
+		        busy == nullptr);
+
+		*busy = false;
+		if (!m_mutex.TryLock()) {
+			*busy = true;
+			return false;
+		}
+
+		*contains   = false;
+		*next_start = 0;
+		bool found  = false;
+		auto next   = m_ranges.upper_bound(addr);
+		for (auto it = next; it != m_ranges.end(); ++it) {
+			if (IsCommittedRangeType(it->second.type)) {
+				*next_start = it->first;
+				break;
+			}
+		}
+		while (next != m_ranges.begin()) {
+			const auto& candidate = *std::prev(next);
+			if (IsCommittedRangeType(candidate.second.type)) {
+				*nearest  = candidate.second;
+				*contains = addr < End(candidate.second.start, candidate.second.size);
+				found     = true;
+				break;
+			}
+			next = std::prev(next);
 		}
 
 		m_mutex.Unlock();
@@ -1828,13 +1876,14 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
                                                    int flags, const char* name) {
 	PRINT_NAME();
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-	return MapFlexibleMemory(addr_in_out, len, prot, flags, name);
+	return LogMemoryApiFailure(__func__,
+	                           MapFlexibleMemory(addr_in_out, len, prot, flags, name));
 }
 
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
 	PRINT_NAME();
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-	return MapFlexibleMemory(addr_in_out, len, prot, flags, "");
+	return LogMemoryApiFailure(__func__, MapFlexibleMemory(addr_in_out, len, prot, flags, ""));
 }
 
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
@@ -2087,7 +2136,9 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 
-	return PhysicalMemory::Size();
+	const size_t size = PhysicalMemory::Size();
+	LOGF("\t size = 0x%016" PRIx64 "\n", static_cast<uint64_t>(size));
+	return size;
 }
 
 int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,
@@ -2288,8 +2339,9 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
                                              size_t alignment, int memory_type,
                                              int64_t* phys_addr_out) {
 	PRINT_NAME();
-	return AllocateDirectMemory(search_start, search_end, len, alignment, memory_type,
-	                            phys_addr_out);
+	return LogMemoryApiFailure(__func__,
+	                           AllocateDirectMemory(search_start, search_end, len, alignment,
+	                                                memory_type, phys_addr_out));
 }
 
 int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, int memory_type,
@@ -2647,14 +2699,17 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
                                         int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "");
+	return LogMemoryApiFailure(
+	    __func__, MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, ""));
 }
 
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "", type);
+	return LogMemoryApiFailure(
+	    __func__,
+	    MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "", type));
 }
 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
@@ -2700,7 +2755,9 @@ int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, 
 		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 
-	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, name);
+	return LogMemoryApiFailure(
+	    __func__,
+	    MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, name));
 }
 
 int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled() {
@@ -2943,21 +3000,21 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	constexpr int    GUEST_MAP_NO_OVERWRITE = 0x80;
 
 	if (addr == nullptr || len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
-		return KERNEL_ERROR_EINVAL;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
 	}
 	if (alignment != 0 && (alignment & (alignment - 1)) != 0 &&
 	    (alignment & (PAGE_SIZE - 1)) != 0) {
-		return KERNEL_ERROR_EINVAL;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
 	}
 
 	uint64_t out_addr            = 0;
 	bool     range_already_added = false;
 	if ((flags & GUEST_MAP_FIXED) != 0) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0) {
-			return KERNEL_ERROR_EINVAL;
+			return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
 		}
 		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
-			return KERNEL_ERROR_ENOMEM;
+			return LogMemoryApiFailure(__func__, KERNEL_ERROR_ENOMEM);
 		}
 		if (ReplaceFixedRangeWithReserved(in_addr, len)) {
 			out_addr            = in_addr;
@@ -2972,12 +3029,12 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	}
 
 	if (out_addr == 0) {
-		return KERNEL_ERROR_ENOMEM;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_ENOMEM);
 	}
 
 	if (!range_already_added &&
 	    !g_virtual_ranges->Add(out_addr, len, 0, 0, 0, VirtualRangeType::Reserved, "anon")) {
-		return KERNEL_ERROR_EBUSY;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
 	}
 
 	*addr = reinterpret_cast<void*>(out_addr);
@@ -3183,7 +3240,24 @@ bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept {
 	info->busy       = busy;
 	info->contains   = contains;
 	info->next_start = next_start;
-	return contains || info->start != 0 || next_start != 0;
+
+	VirtualRanges::Range committed {};
+	bool                 committed_contains   = false;
+	uint64_t             committed_next_start = 0;
+	bool                 committed_busy       = false;
+	if (ranges->TryQueryNearestCommitted(addr, &committed, &committed_contains,
+	                                     &committed_next_start, &committed_busy)) {
+		info->committed_start = committed.start;
+		info->committed_end   = committed.start + committed.size;
+		info->committed_kind  = VirtualRangeTypeName(committed.type);
+		CopyVirtualRangeName(info->committed_name, committed.name);
+	}
+	info->contains_committed   = committed_contains;
+	info->committed_next_start = committed_next_start;
+	info->busy                 = info->busy || committed_busy;
+
+	return contains || info->start != 0 || next_start != 0 || committed_contains ||
+	       info->committed_start != 0 || committed_next_start != 0;
 }
 
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
@@ -3599,11 +3673,11 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 	constexpr uint64_t POOL_RESERVE_ALIGNMENT = 0x200000;
 
 	if (addr_out == nullptr || len == 0 || !IsAligned(len, POOL_RESERVE_ALIGNMENT)) {
-		return KERNEL_ERROR_EINVAL;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
 	}
 	if (alignment != 0 &&
 	    (!std::has_single_bit(alignment) || !IsAligned(alignment, POOL_RESERVE_ALIGNMENT))) {
-		return KERNEL_ERROR_EINVAL;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
 	}
 
 	void*      out_addr          = addr_in;
@@ -3615,17 +3689,17 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 		if (!g_virtual_ranges->Query(out_vaddr, 0, &reserved_range) ||
 		    reserved_range.start != out_vaddr || reserved_range.size != len ||
 		    !IsReservedRangeType(reserved_range.type)) {
-			return KERNEL_ERROR_EBUSY;
+			return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
 		}
 		if (!g_virtual_ranges->ReplaceSpan(out_vaddr, len, VirtualRangeType::Reserved, 0, 0, 0,
 		                                   VirtualRangeType::PoolReserved, reserved_range.name)) {
-			return KERNEL_ERROR_EBUSY;
+			return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
 		}
 		*addr_out = out_addr;
 		LOGF("\t out_addr  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(out_addr));
 	}
 
-	return ret;
+	return LogMemoryApiFailure(__func__, ret);
 }
 
 int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags) {
@@ -3646,13 +3720,13 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 
 	if (addr == nullptr || len == 0 || !IsAligned(len, POOL_COMMIT_ALIGNMENT) ||
 	    (prot & PROT_CPU_EXEC) != 0) {
-		return KERNEL_ERROR_EINVAL;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
 	}
 
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
 
 	if (!DecodeMemoryProtection(prot, &mode)) {
-		return KERNEL_ERROR_EINVAL;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EINVAL);
 	}
 
 	const auto vaddr = reinterpret_cast<uint64_t>(addr);
@@ -3661,12 +3735,12 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	if (!g_virtual_ranges->Query(vaddr, 0, &old_range) ||
 	    old_range.type != VirtualRangeType::PoolReserved ||
 	    len > old_range.size - (vaddr - old_range.start)) {
-		return KERNEL_ERROR_EACCES;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EACCES);
 	}
 
 	std::vector<PooledMemory::Mapping> mappings;
 	if (!g_pooled_memory->Allocate(vaddr, len, &mappings)) {
-		return KERNEL_ERROR_ENOMEM;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_ENOMEM);
 	}
 
 	size_t mapped_size = 0;
@@ -3687,7 +3761,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 			LOGF_COLOR(Log::Color::Red, "\t pool backing map failed: %s\n",
 			           GuestBackingStore::GetFailureReasonName(failure_reason));
 			rollback();
-			return KERNEL_ERROR_ENOMEM;
+			return LogMemoryApiFailure(__func__, KERNEL_ERROR_ENOMEM);
 		}
 		mapped_size += mapping.size;
 	}
@@ -3695,7 +3769,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	if (!g_virtual_ranges->ReplaceSpan(vaddr, len, VirtualRangeType::PoolReserved, 0, prot, type,
 	                                   VirtualRangeType::Pooled, old_range.name)) {
 		rollback();
-		return KERNEL_ERROR_EBUSY;
+		return LogMemoryApiFailure(__func__, KERNEL_ERROR_EBUSY);
 	}
 
 	MapGpuRange(vaddr, len);

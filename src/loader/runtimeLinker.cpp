@@ -650,6 +650,38 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Guest code, stacks and mapped memory live well above the host addresses the loader uses for
+// its own data, so a smaller register value is an offset, a length or a plain integer.
+static constexpr uint64_t kGuestPointerFloor = 0x200000000ull;
+
+// Extra line for an address that is not inside a mapped range: says which range is actually
+// backed by memory and how far away it is. A reserved placeholder alone cannot explain a fault,
+// because the guest only booked that address space without committing anything to it.
+static void PrintNearestMappedRange(uint64_t vaddr,
+                                    const Libs::LibKernel::Memory::GuestAddressInfo& mapping) {
+	if (mapping.busy || mapping.contains_committed) {
+		return;
+	}
+	if (mapping.committed_start == 0) {
+		if (mapping.committed_next_start != 0) {
+			std::printf("      nearest mapped: none below, first mapped range at 0x%" PRIx64 "\n",
+			            mapping.committed_next_start);
+		} else {
+			std::printf("      nearest mapped: none\n");
+		}
+		return;
+	}
+	std::printf("      nearest mapped: 0x%" PRIx64 " bytes past %s \"%s\" [%016" PRIx64
+	            "..%016" PRIx64 "), size 0x%" PRIx64,
+	            vaddr - mapping.committed_end, mapping.committed_kind, mapping.committed_name,
+	            mapping.committed_start, mapping.committed_end,
+	            mapping.committed_end - mapping.committed_start);
+	if (mapping.committed_next_start != 0) {
+		std::printf(", next mapped 0x%" PRIx64, mapping.committed_next_start);
+	}
+	std::printf("\n");
+}
+
 // Reports module+offset and the nearest guest mapping for a value that should be an address.
 static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
 	std::string module;
@@ -674,6 +706,7 @@ static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
 		std::printf(", in %s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64 "\n",
 		            mapping.kind, mapping.name, mapping.start, mapping.end,
 		            mapping.end - mapping.start);
+		PrintNearestMappedRange(vaddr, mapping);
 		return;
 	}
 	if (mapping.start != 0) {
@@ -684,9 +717,11 @@ static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
 			std::printf(", next mapping 0x%" PRIx64, mapping.next_start);
 		}
 		std::printf("\n");
+		PrintNearestMappedRange(vaddr, mapping);
 		return;
 	}
 	std::printf(", below the first guest mapping 0x%" PRIx64 "\n", mapping.next_start);
+	PrintNearestMappedRange(vaddr, mapping);
 }
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
@@ -740,6 +775,25 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+		// Pointers the guest was working with explain the fault far better than the instruction
+		// alone: base+offset stores dominate and only the base says how big the buffer is.
+		{
+			struct NamedRegister {
+				const char* name;
+				uint64_t    value;
+			};
+			const NamedRegister registers[] = {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+			    {"rsi", info->rsi}, {"rdi", info->rdi}, {"rbp", info->rbp}, {"rsp", info->rsp},
+			    {"r8", info->r8},   {"r9", info->r9},   {"r12", info->r12}, {"r13", info->r13},
+			    {"r14", info->r14}, {"r15", info->r15},
+			};
+			for (const auto& reg: registers) {
+				if (reg.value >= kGuestPointerFloor) {
+					PrintGuestAddressInfo(reg.name, reg.value);
+				}
+			}
+		}
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");

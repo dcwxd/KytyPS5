@@ -152,6 +152,16 @@ struct GuestAddressInfo {
 	uint64_t    next_start = 0;     // First range above addr, 0 when there is none.
 	const char* kind       = "unknown";
 	char        name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
+
+	// The same relation to the nearest range that is actually backed by memory. Reserved
+	// placeholders describe address space the guest only booked, so they cannot explain whether
+	// a faulting access ever had a chance to succeed.
+	bool        contains_committed   = false;
+	uint64_t    committed_start      = 0; // Mapped range containing addr, or the nearest below.
+	uint64_t    committed_end        = 0;
+	uint64_t    committed_next_start = 0; // First mapped range above addr, 0 when there is none.
+	const char* committed_kind       = "unknown";
+	char        committed_name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
 };
 [[nodiscard]] bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept;
 
