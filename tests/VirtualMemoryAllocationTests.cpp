@@ -6132,6 +6132,21 @@ void TestGuestRangeRunsAroundFault() {
 	      "a truncated window lost or invented runs");
 	Check(test, runs[0].count == 2, "the truncated window changed the first run");
 
+	// The totals describe the whole window even when only one run fits, because a fault report
+	// relies on them to say how far the guest's committed memory reached.
+	Libs::LibKernel::Memory::GuestRangeSummary summary {};
+	total = 0;
+	count = Libs::LibKernel::Memory::GetGuestRangeRuns(base, base + page * 4, runs.data(), 1, &total,
+	                                                  &busy, &summary);
+	Check(test, !busy && summary.runs == 2 && summary.total_bytes == page * 4,
+	      "the window summary did not count every byte in the window");
+	Check(test, summary.mapped_bytes == page * 2 && summary.reserved_bytes == page * 2,
+	      "the window summary did not separate mapped from reserved bytes");
+	Check(test, summary.last_mapped_end == base + page * 2,
+	      "the window summary reported the wrong end for the mappings");
+	Check(test, summary.largest_gap_size == 0 && summary.largest_gap_start == 0,
+	      "a fully covered window reported a hole");
+
 	count = Libs::LibKernel::Memory::GetGuestRangeRuns(base + page * 3, base, runs.data(),
 	                                                  runs.size(), &total, &busy);
 	Check(test, !busy && count == 0 && total == 0, "an empty window was not empty");

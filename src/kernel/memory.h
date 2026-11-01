@@ -176,11 +176,24 @@ struct GuestRangeRun {
 	const char* kind      = "";
 	char        name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
 };
+// Totals over the whole window, independent of how many runs fit in the caller's buffer. A
+// buffer base can be thousands of runs away from the fault, so a truncated list alone cannot say
+// how much address space the guest actually committed on the way there.
+struct GuestRangeSummary {
+	unsigned runs              = 0;
+	uint64_t total_bytes       = 0; // Every byte covered by a range in the window.
+	uint64_t mapped_bytes      = 0; // Bytes of ranges that are backed by memory.
+	uint64_t reserved_bytes    = 0; // Bytes the guest only booked.
+	uint64_t last_mapped_end   = 0; // End of the highest mapped range in the window.
+	uint64_t largest_gap_start = 0; // Longest span of the window with no range at all.
+	uint64_t largest_gap_size  = 0;
+};
 // Fills at most `capacity` runs for the ranges intersecting [start, end), oldest first.
 // `*total` receives the number of runs in the window, including ones that did not fit.
 // `*busy` is set when the table was locked and nothing was read; the call never waits for it.
 unsigned GetGuestRangeRuns(uint64_t start, uint64_t end, GuestRangeRun* out, unsigned capacity,
-                           uint64_t* total, bool* busy) noexcept;
+                           uint64_t* total, bool* busy,
+                           GuestRangeSummary* summary = nullptr) noexcept;
 
 // The most recent mutations of the guest range table, oldest first. A fault report that only
 // shows the surviving mappings cannot tell whether a large buffer was ever committed, so the

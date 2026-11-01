@@ -634,11 +634,14 @@ public:
 	// neighbours, but direct mappings are exempt from it, so a window over one buffer still
 	// contains a few hundred 2 MiB entries that differ only in their address.
 	unsigned TryQueryWindow(uint64_t start, uint64_t end, GuestRangeRun* out, unsigned capacity,
-	                        uint64_t* total, bool* busy) {
+	                        uint64_t* total, bool* busy, GuestRangeSummary* summary) {
 		EXIT_IF(out == nullptr || total == nullptr || busy == nullptr);
 
 		*busy  = false;
 		*total = 0;
+		if (summary != nullptr) {
+			*summary = GuestRangeSummary {};
+		}
 		if (capacity == 0 || start >= end) {
 			return 0;
 		}
@@ -667,6 +670,37 @@ public:
 		const char* run_kind  = "";
 		char        run_name[KERNEL_MAXIMUM_NAME_LENGTH] = {};
 		uint64_t    run_total = 0;
+		// Byte totals and the size of the largest hole are kept over the whole window, because a
+		// truncated list of runs cannot show that the heap stopped growing well short of the fault.
+		uint64_t cursor = start;
+		const auto note_gap = [&](uint64_t gap_start, uint64_t gap_end) {
+			if (summary == nullptr || gap_end <= gap_start) {
+				return;
+			}
+			const uint64_t size = gap_end - gap_start;
+			if (size > summary->largest_gap_size) {
+				summary->largest_gap_size  = size;
+				summary->largest_gap_start = gap_start;
+			}
+		};
+		const auto note_range = [&](const Range& range) {
+			if (summary == nullptr) {
+				return;
+			}
+			const uint64_t range_end  = End(range.start, range.size);
+			const uint64_t begin      = range.start > start ? range.start : start;
+			const uint64_t finish     = range_end < end ? range_end : end;
+			const uint64_t bytes      = finish > begin ? finish - begin : 0;
+			summary->total_bytes += bytes;
+			if (IsReservedRangeType(range.type)) {
+				summary->reserved_bytes += bytes;
+			} else {
+				summary->mapped_bytes += bytes;
+				if (finish > summary->last_mapped_end) {
+					summary->last_mapped_end = finish;
+				}
+			}
+		};
 		const auto  flush     = [&] {
 			if (!have_run) {
 				return;
@@ -688,6 +722,14 @@ public:
 			const auto& range = it->second;
 			if (range.start >= end) {
 				break;
+			}
+			note_range(range);
+			if (range.start > cursor) {
+				note_gap(cursor, range.start < end ? range.start : end);
+			}
+			const uint64_t range_end = End(range.start, range.size);
+			if (range_end > cursor) {
+				cursor = range_end < end ? range_end : end;
 			}
 			const auto* kind = VirtualRangeTypeName(range.type);
 			if (have_run && End(run_start, run_size) == range.start && run_kind == kind &&
@@ -711,6 +753,9 @@ public:
 		flush();
 
 		*total = run_total;
+		if (summary != nullptr) {
+			summary->runs = static_cast<unsigned>(run_total);
+		}
 		m_mutex.Unlock();
 		return written;
 	}
@@ -3536,7 +3581,7 @@ bool DescribeGuestAddress(uint64_t addr, GuestAddressInfo* info) noexcept {
 }
 
 unsigned GetGuestRangeRuns(uint64_t start, uint64_t end, GuestRangeRun* out, unsigned capacity,
-                           uint64_t* total, bool* busy) noexcept {
+                           uint64_t* total, bool* busy, GuestRangeSummary* summary) noexcept {
 	auto* ranges = g_virtual_ranges.get();
 	if (ranges == nullptr) {
 		if (total != nullptr) {
@@ -3560,7 +3605,7 @@ unsigned GetGuestRangeRuns(uint64_t start, uint64_t end, GuestRangeRun* out, uns
 	}
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex,
 	                                                           std::adopt_lock);
-	return ranges->TryQueryWindow(start, end, out, capacity, total, busy);
+	return ranges->TryQueryWindow(start, end, out, capacity, total, busy, summary);
 }
 
 // Both rings are filled by one writer at a time and read without any lock, so each entry is

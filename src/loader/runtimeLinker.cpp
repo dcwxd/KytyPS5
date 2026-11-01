@@ -899,45 +899,57 @@ static void PrintGuestAddressInfo(const char* label, uint64_t vaddr) {
 // ranges of the same kind and name are compressed because the guest maps direct memory in small
 // pieces that are never coalesced in the table.
 static void PrintGuestRangeWindow(uint64_t fault, uint64_t base, const char* base_name) {
-	constexpr uint64_t kBack    = 0x20000000;
-	constexpr uint64_t kForward = 0x4000000;
-	constexpr uint64_t kReach   = 0x40000000;
+	constexpr uint64_t kReach     = 0x40000000;
+	constexpr uint64_t kHeadSpan  = 0x6000000;
+	constexpr uint64_t kTailSpan  = 0x2000000;
+	constexpr unsigned kWindowCap = 128;
 
-	// The interesting span is the one the guest believes it owns: from the base of the access
-	// to the fault. Only fall back to a fixed window around the fault without a usable base.
-	uint64_t low  = fault > kBack ? fault - kBack : 0;
-	uint64_t high = fault > UINT64_MAX - kForward ? UINT64_MAX : fault + kForward;
-	if (base != 0 && base <= fault && fault - base <= kReach) {
-		low = base;
-	}
-	if (base != 0 && base > high && base - high <= kReach) {
-		high = base > UINT64_MAX - 0x1000 ? UINT64_MAX : base + 0x1000;
-	}
-
-	constexpr unsigned kCapacity = 128;
-	constexpr unsigned kHead     = 40;
-	constexpr unsigned kTail     = 24;
-	std::array<Libs::LibKernel::Memory::GuestRangeRun, kCapacity> runs {};
-	uint64_t                                                       total = 0;
-	bool                                                           busy  = false;
-	const auto count = Libs::LibKernel::Memory::GetGuestRangeRuns(low, high, runs.data(),
-	                                                             runs.size(), &total, &busy);
+	// The interesting span is the one the guest believes it owns: from the base of the access to
+	// the fault. Only fall back to a fixed window around the fault without a usable base.
+	const uint64_t low =
+	    (base != 0 && base <= fault && fault - base <= kReach)
+	        ? base
+	        : (fault > 0x20000000 ? fault - 0x20000000 : 0);
+	const uint64_t high = fault == UINT64_MAX ? UINT64_MAX : fault + 1;
 
 	std::printf("--- guest ranges in [%016" PRIx64 "..%016" PRIx64
 	            "), adjacent same-kind ranges compressed ---\n",
 	            low, high);
+
+	// A guest heap maps a repeating stripe of direct chunks and alignment gaps, so the list is
+	// truncated to the ends. The totals still cover the whole window: only they show how much
+	// address space the guest committed on the way from the base to the fault.
+	std::array<Libs::LibKernel::Memory::GuestRangeRun, 4> probe {};
+	uint64_t                                              total = 0;
+	bool                                                  busy  = false;
+	Libs::LibKernel::Memory::GuestRangeSummary            summary {};
+	Libs::LibKernel::Memory::GetGuestRangeRuns(low, high, probe.data(), probe.size(), &total, &busy,
+	                                           &summary);
 	if (busy) {
 		std::printf("  (mapping table busy)\n");
 		return;
 	}
-	if (count == 0) {
+	if (summary.runs == 0) {
 		std::printf("  (none)\n");
 		return;
 	}
-	const auto print_run = [&](unsigned index) {
-		const auto& run = runs[index];
-		const auto  end =
-		    run.size > UINT64_MAX - run.start ? UINT64_MAX : run.start + run.size;
+	std::printf("  %u runs, mapped 0x%" PRIx64 " bytes", summary.runs, summary.mapped_bytes);
+	if (summary.last_mapped_end != 0) {
+		std::printf(" (last mapped ends %016" PRIx64, summary.last_mapped_end);
+		if (summary.last_mapped_end < fault) {
+			std::printf(", 0x%" PRIx64 " bytes short of the fault", fault - summary.last_mapped_end);
+		}
+		std::printf(")");
+	}
+	std::printf(", reserved 0x%" PRIx64 " bytes", summary.reserved_bytes);
+	if (summary.largest_gap_size != 0) {
+		std::printf(", largest hole 0x%" PRIx64 " bytes at ", summary.largest_gap_size);
+		std::printf("%016" PRIx64, summary.largest_gap_start);
+	}
+	std::printf("\n");
+
+	const auto print_run = [&](const Libs::LibKernel::Memory::GuestRangeRun& run) {
+		const auto end = run.size > UINT64_MAX - run.start ? UINT64_MAX : run.start + run.size;
 		std::printf("  %-9s \"%s\" [%016" PRIx64 "..%016" PRIx64 "), size 0x%" PRIx64, run.kind,
 		            run.name, run.start, end, run.size);
 		if (run.count > 1) {
@@ -955,26 +967,40 @@ static void PrintGuestRangeWindow(uint64_t fault, uint64_t base, const char* bas
 		}
 		std::printf("\n");
 	};
-
-	// A guest heap maps a repeating stripe of direct chunks and alignment gaps, which fills even
-	// a compressed window with near-identical runs. Keep the ends: the base mapping and the
-	// ranges immediately around the fault are the ones that explain the overrun.
-	if (count <= kHead + kTail) {
-		for (unsigned i = 0; i < count; i++) {
-			print_run(i);
+	const auto print_window = [&](uint64_t wlow, uint64_t whigh) {
+		if (wlow < low) {
+			wlow = low;
 		}
+		if (whigh > high) {
+			whigh = high;
+		}
+		if (wlow >= whigh) {
+			return;
+		}
+		std::array<Libs::LibKernel::Memory::GuestRangeRun, kWindowCap> runs {};
+		uint64_t window_total = 0;
+		bool     window_busy  = false;
+		const auto count = Libs::LibKernel::Memory::GetGuestRangeRuns(
+		    wlow, whigh, runs.data(), runs.size(), &window_total, &window_busy);
+		if (window_busy || count == 0) {
+			return;
+		}
+		for (unsigned i = 0; i < count; i++) {
+			print_run(runs[i]);
+		}
+		if (window_total > count) {
+			std::printf("  ... %" PRIu64 " more runs here ...\n", window_total - count);
+		}
+	};
+
+	if (high - low <= kHeadSpan + kTailSpan) {
+		print_window(low, high);
 		return;
 	}
-	for (unsigned i = 0; i < kHead; i++) {
-		print_run(i);
-	}
-	std::printf("  ... %u runs omitted ...\n", count - kHead - kTail);
-	for (unsigned i = count - kTail; i < count; i++) {
-		print_run(i);
-	}
-	if (total > count) {
-		std::printf("  ... %" PRIu64 " more runs in the window ...\n", total - count);
-	}
+	std::printf("  ... the window from %s:\n", base_name);
+	print_window(low, low + kHeadSpan);
+	std::printf("  ... the window at the fault:\n");
+	print_window(high - kTailSpan, high);
 }
 
 static void PrintCodeWindow(const char* label, uint64_t address, int before, int after) {
