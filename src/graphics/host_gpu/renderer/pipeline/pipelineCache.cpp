@@ -158,6 +158,32 @@ void DumpShader(std::span<const uint32_t> words, const std::string& name) {
         file.Write(words.data(), words.size_bytes());
 }
 
+// The binary .spv dumps cannot be read in a terminal or chat log; this writes the
+// human-readable disassembly next to them so translated guest shaders can be inspected
+// where the game runs.
+void DumpShaderDisassembly(const std::vector<uint32_t>& words, const std::string& name) {
+        if (!Config::GraphicsDebugDumpEnabled() || words.empty()) {
+                return;
+        }
+        spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
+        std::string          text;
+        if (!disassembler.Disassemble(words, &text,
+                                      static_cast<uint32_t>(
+                                          SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES |
+                                          SPV_BINARY_TO_TEXT_OPTION_INDENT))) {
+                return;
+        }
+        const auto path = Config::GetShaderLogFolder() / name;
+        Common::File::CreateDirectories(path.parent_path());
+        Common::File file(path);
+        if (file.IsInvalid()) {
+                const auto path_text = Common::PathToString(path);
+                LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
+                return;
+        }
+        file.Write(text.data(), static_cast<uint32_t>(text.size()));
+}
+
 void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
         if (!Config::ShaderValidationEnabled()) {
@@ -345,6 +371,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
         const auto* stage = ShaderRecompiler::StageName(key.stage);
         DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+        DumpShaderDisassembly(
+            result.spirv, fmt::format("{}_{:016x}_{:016x}.spvasm", stage, key.hash, id));
         ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
         auto& module = program.modules.emplace_back(ShaderModule {
             .id             = id,
