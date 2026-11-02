@@ -6,4 +6,5 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
-CMakeUserPresets.jsondebug/eboot.bin
+CMakeUserPresets.json
+debug/eboot.bin
