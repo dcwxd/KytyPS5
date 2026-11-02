@@ -1248,7 +1248,9 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 	};
 	std::array<Input, 8> inputs {};
 	uint32_t             input_count = 0;
+	uint32_t             stage_index = 0;
 	for (const PreparedBindings* stage: stages) {
+		const auto stage_id = stage_index++;
 		if (stage == nullptr) {
 			continue;
 		}
@@ -1271,11 +1273,12 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 				           static_cast<uint64_t>(ex.width) * ex.height};
 			}
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "flip-bind: pair slot={} binding={} desc addr=0x{:016x} size=0x{:x} fmt={} "
-			    "type={} view mip={} levels={} layer={} layers={} -> image addr=0x{:016x} "
-			    "serial=0x{:016x} fmt={} {}x{} levels={} layers={} gpu_modified={} "
-			    "imgdirty={} video_out={}\n",
-			    slot, binding_index, image.desc.info.data.address, image.desc.info.data.size,
+			    "flip-bind: pair slot={} stage={} binding={} desc addr=0x{:016x} size=0x{:x} "
+			    "fmt={} type={} view mip={} levels={} layer={} layers={} -> image "
+			    "addr=0x{:016x} serial=0x{:016x} fmt={} {}x{} levels={} layers={} "
+			    "gpu_modified={} imgdirty={} video_out={}\n",
+			    slot, stage_id, binding_index, image.desc.info.data.address,
+			    image.desc.info.data.size,
 			    vk::to_string(image.desc.info.pixel_format),
 			    BindingTypeName(image.desc.type), image.desc.view_info.base_level,
 			    image.desc.view_info.level_count, image.desc.view_info.base_layer,
@@ -1294,7 +1297,9 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 		// stale, and every sampled color multiplied by such a scalar turns black. Compare the
 		// raw CPU view against the GPU-synced view, and probe the ladder's scalar dword.
 		constexpr uint64_t kScalarOffset = 2160;
+		uint32_t stage_index = 0;
 		for (const PreparedBindings* stage: stages) {
+			const auto stage_id = stage_index++;
 			if (stage == nullptr) {
 				continue;
 			}
@@ -1314,9 +1319,9 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 				    LibKernel::Memory::TryReadBacking(source.address + kScalarOffset,
 				                                      scalar.data(), scalar.size());
 				Log::WriteToConsoleAndLog(fmt::format(
-				    "flip-param: pair slot={} buffer={} addr=0x{:016x} size=0x{:x} dirty={} "
-				    "raw={} synced={} scalar={}\n",
-				    slot, binding_index, source.address, source.size,
+				    "flip-param: pair slot={} stage={} buffer={} addr=0x{:016x} size=0x{:x} "
+				    "dirty={} raw={} synced={} scalar={}\n",
+				    slot, stage_id, binding_index, source.address, source.size,
 				    buffers_cache.HasGpuDirtyBytes(source.address, source.size) ? "true"
 				                                                                   : "false",
 				    raw_ok ? fmt::format("{:02x}", fmt::join(raw, " "))
