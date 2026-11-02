@@ -1361,6 +1361,25 @@ static void PrintFaultingGuestHookHit() {
 	const auto& hit = g_guest_hook_ring[(total - 1) % g_guest_hook_ring.size()];
 	if (hit.sequence == total - 1) {
 		PrintOneGuestHookHit(hit);
+		// The callee spills the descriptor fields it loaded and the caller parks the index vector
+		// on its own frame. Comparing those live copies with the entry snapshot says whether the
+		// descriptor was rewritten after the hook ran.
+		const auto dump_live = [](const char* label, uint64_t address, size_t size) {
+			std::printf("   %s %016" PRIx64 ":", label, address);
+			if (!IsReadableRange(address, size)) {
+				std::printf(" (not mapped)\n");
+				return;
+			}
+			const auto* bytes = reinterpret_cast<const uint8_t*>(address);
+			for (size_t i = 0; i < size / 4; i++) {
+				uint32_t value = 0;
+				std::memcpy(&value, bytes + i * 4, sizeof(value));
+				std::printf("%s%08" PRIx32, (i % 8 == 0) ? "\n    " : " ", value);
+			}
+			std::printf("\n");
+		};
+		dump_live("live descriptor", hit.rdx, 0x80);
+		dump_live("live index vector", hit.stack_arguments[0], 0x20);
 	} else {
 		std::printf("#%" PRIu64 " (slot overwritten)\n", total - 1);
 	}
