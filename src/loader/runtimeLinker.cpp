@@ -1273,7 +1273,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					if (linker->TryDescribeAddress(stack[i], &module, &module_offset)) {
 						std::printf("code of return address stack+%02x (%s+0x%" PRIx64 "):\n",
 						            i * 8, module.c_str(), module_offset);
-						PrintCodeWindow("caller", stack[i], 48, 16);
+						// The callee's own prologue was never the question: it passes rdi straight
+						// through to the swizzled stores. The destination base is therefore built by
+						// the caller, well before the indirect call that lands in the tiled helper,
+						// so reach deep enough to catch the argument setup.
+						PrintCodeWindow("caller", stack[i], printed == 0 ? 320 : 128, 16);
 						printed++;
 					}
 				}
