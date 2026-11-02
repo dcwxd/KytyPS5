@@ -1125,10 +1125,29 @@ static void AppendGuestHookSpecs(std::string_view text, std::vector<GuestHookSpe
 			spec.name = item.substr(0, equals);
 			number    = item.substr(equals + 1);
 		}
+		// Offsets are always relative to the main executable's base, and the reports spell them as
+		// "base+0x...". Accept that spelling instead of rejecting it as a malformed number.
+		const auto trim = [](std::string& value) {
+			const auto first = value.find_first_not_of(" \t");
+			if (first == std::string::npos) {
+				value.clear();
+				return;
+			}
+			value.erase(0, first);
+			value.erase(value.find_last_not_of(" \t") + 1);
+		};
+		trim(number);
+		if (number.size() >= 5 && number[0] == 'b' && number[1] == 'a' && number[2] == 's' &&
+		    number[3] == 'e' && number[4] == '+') {
+			number.erase(0, 5);
+			trim(number);
+		}
 		char*                    end    = nullptr;
 		const unsigned long long offset = std::strtoull(number.c_str(), &end, 0);
 		if (end == number.c_str() || *end != '\0' || offset == 0) {
-			Log::WriteToConsoleAndLog(fmt::format("Guest hook: ignoring invalid entry '{}'\n", item));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest hook: ignoring invalid entry '{}' (expected 0xOFFSET or name=0xOFFSET)\n",
+			    item));
 			continue;
 		}
 		spec.offset = offset;
