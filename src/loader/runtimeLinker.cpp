@@ -1209,7 +1209,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// preamble that computes the base register and its huge offsets. Reach back far enough to
 		// see the whole unrolled body and its setup.
 		{
-			constexpr int kCodeBefore = 256;
+			// The callee of the tiled copy starts 0x13b before the faulting store: without the
+			// prologue the report cannot show where the destination base, the linear offset and
+			// the surface descriptor came from. 256 bytes stopped just short of it.
+			constexpr int kCodeBefore = 384;
 			constexpr int kCodeAfter  = 64;
 			const bool    wide = IsReadableRange(info->exception_address - kCodeBefore,
 			                                     kCodeBefore + kCodeAfter);
