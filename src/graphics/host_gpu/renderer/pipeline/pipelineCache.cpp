@@ -957,6 +957,18 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
                         alpha_source = ps_input_info.alpha_blend_source;
                 }
                 static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
+                if (Config::DebugBlendOneEnabled()) {
+                        // Debug: src-alpha blending over an alpha-less or zero-alpha export is
+                        // indistinguishable from a draw that never ran; unblended writes expose
+                        // the difference on screen.
+                        static_params.blend_enable[slot] = false;
+                        static std::atomic_bool logged = false;
+                        if (!logged.exchange(true, std::memory_order_relaxed)) {
+                                Log::WriteToConsoleAndLog(
+                                    "Warning: --debug-blend-one disables all blending; overlapping "
+                                    "UI will look wrong (debug).\n");
+                        }
+                }
                 if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
                     ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
                         static_params.blend_enable[slot] = false;

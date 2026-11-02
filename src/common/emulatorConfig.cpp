@@ -217,6 +217,10 @@ bool DebugDepthAlwaysEnabled() {
 	return g_config->debug_depth_always;
 }
 
+bool DebugBlendOneEnabled() {
+	return g_config->debug_blend_one;
+}
+
 bool DebugSampleStatsEnabled() {
 	return g_config->debug_sample_stats;
 }

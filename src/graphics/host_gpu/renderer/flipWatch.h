@@ -28,10 +28,46 @@ public:
 		uint64_t   vertex_id            = 0;
 		uint64_t   pixel_id             = 0;
 		uint32_t   draws                = 0;
+		// The first draw's state, so the periodic report keeps the details that first appeared
+		// long before the log the user reads.
+		uint64_t   address              = 0;
 		uint32_t   first_index_count    = 0;
 		uint32_t   first_instance_count = 0;
+		uint32_t   packed_extent        = 0; // width << 16 | height
+		uint32_t   mrt_mask             = 0;
+		uint32_t   ps_shader_mask       = 0;
+		uint32_t   mode0                = 0;
+		uint8_t    export0              = 0;
+		uint8_t    cc_mode              = 0;
+		bool       blend_enable         = false;
+		uint8_t    blend_src            = 0;
+		uint8_t    blend_dst            = 0;
+		uint8_t    blend_comb           = 0;
+		bool       pixel_kill           = false;
+		bool       ps_active            = false;
 		const char* first_name          = "";
 		bool       seen                 = false;
+	};
+
+	// Everything the pair registry records about a draw at its first appearance.
+	struct DrawSnapshot {
+		uint64_t   address              = 0;
+		uint32_t   index_count          = 0;
+		uint32_t   instance_count       = 0;
+		uint32_t   width                = 0;
+		uint32_t   height               = 0;
+		uint32_t   mrt_mask             = 0;
+		uint32_t   ps_shader_mask       = 0;
+		uint32_t   mode0                = 0;
+		uint8_t    export0              = 0;
+		uint8_t    cc_mode              = 0;
+		bool       blend_enable         = false;
+		uint8_t    blend_src            = 0;
+		uint8_t    blend_dst            = 0;
+		uint8_t    blend_comb           = 0;
+		bool       pixel_kill           = false;
+		bool       ps_active            = false;
+		const char* name                = "";
 	};
 
 	// True when this serial was not watched before. Surfaces cycle with the game's buffering;
@@ -111,8 +147,7 @@ public:
 	// True the first time this shader pair writes a watched surface; the pair keeps the
 	// reporting details of that first draw. A full registry stays silent; that many distinct
 	// writers is itself the report.
-	bool NoteDrawPair(uint64_t vertex_id, uint64_t pixel_id, uint32_t index_count,
-	                  uint32_t instance_count, const char* name) {
+	bool NoteDrawPair(uint64_t vertex_id, uint64_t pixel_id, const DrawSnapshot& snapshot) {
 		uint32_t free_slot = kNoMatch;
 		for (uint32_t index = 0; index < kPairSlots; index++) {
 			Pair& pair = m_pairs[index];
@@ -128,20 +163,40 @@ public:
 		if (free_slot == kNoMatch) {
 			return false;
 		}
-		m_pairs[free_slot] =
-		    Pair {vertex_id, pixel_id, 1, index_count, instance_count, name, true};
+		m_pairs[free_slot] = Pair {
+		    vertex_id,
+		    pixel_id,
+		    1,
+		    snapshot.address,
+		    snapshot.index_count,
+		    snapshot.instance_count,
+		    (snapshot.width << 16u) | snapshot.height,
+		    snapshot.mrt_mask,
+		    snapshot.ps_shader_mask,
+		    snapshot.mode0,
+		    snapshot.export0,
+		    snapshot.cc_mode,
+		    snapshot.blend_enable,
+		    snapshot.blend_src,
+		    snapshot.blend_dst,
+		    snapshot.blend_comb,
+		    snapshot.pixel_kill,
+		    snapshot.ps_active,
+		    snapshot.name,
+		    true,
+		};
 		return true;
 	}
 
-	// Reports every seen pair's count since the last report, then clears those counts.
+	// Reports every seen pair with the state of its first draw and the count since the last
+	// report, then clears those counts.
 	template <typename Report>
 	void ReportPairs(Report&& report) {
 		for (auto& pair: m_pairs) {
 			if (!pair.seen) {
 				continue;
 			}
-			report(pair.vertex_id, pair.pixel_id, pair.draws, pair.first_index_count,
-			       pair.first_instance_count, pair.first_name);
+			report(pair);
 			pair.draws = 0;
 		}
 	}

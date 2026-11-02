@@ -1066,15 +1066,20 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			const auto  flip_draws   = watch.TakeDrawCount();
 			const auto  dropped      = watch.TakeDropCount();
 			const auto  skipped      = watch.TakeSkipCount();
-			watch.ReportPairs([](uint64_t vertex_id, uint64_t pixel_id, uint32_t draws,
-			                     uint32_t indices, uint32_t instances, const char* name) {
-				if (draws == 0) {
+			watch.ReportPairs([](const FlipWatch::Pair& pair) {
+				if (pair.draws == 0) {
 					return;
 				}
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "flip watch: pair vs=0x{:016x} ps=0x{:016x} draws={} {} indices={} "
-				    "instances={}\n",
-				    vertex_id, pixel_id, draws, name, indices, instances));
+				    "instances={} addr=0x{:016x} {}x{} mrt={} cc_mode={} blend={} src={} dst={} "
+				    "comb={} ps_mask=0x{:x} mode0={} export0=0x{:02x} kill={} ps_active={}\n",
+				    pair.vertex_id, pair.pixel_id, pair.draws, pair.first_name,
+				    pair.first_index_count, pair.first_instance_count, pair.address,
+				    pair.packed_extent >> 16u, pair.packed_extent & 0xffffu, pair.mrt_mask,
+				    pair.cc_mode, pair.blend_enable ? "true" : "false", pair.blend_src,
+				    pair.blend_dst, pair.blend_comb, pair.ps_shader_mask, pair.mode0,
+				    pair.export0, pair.pixel_kill ? "true" : "false", pair.ps_active));
 			});
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "flip watch: {} draws into scan-out this window, {} dropped no-vertex-stage "

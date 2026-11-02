@@ -1018,26 +1018,30 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			const auto pixel_id  = state.ps_input_info.stage.module != nullptr
 			                           ? state.ps_input_info.stage.module->id
 			                           : 0;
-			if (watch.NoteDrawPair(vertex_id, pixel_id, draw.index_count, draw.instance_count,
-			                       draw.Name())) {
-				// Blend, export and pixel-kill state decide whether a composite that reaches
-				// the surface also leaves something in it.
-				const auto&              cc        = ctx.GetColorControl();
-				const auto&              blend     = ctx.GetBlendControl(color.target_slot);
-				const auto               extent    = color.Extent();
-				const uint32_t           mask      = ctx.GetRenderTargetMask();
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "flip-draw: {} writes scan-out address=0x{:016x} slot={} extent={}x{} "
-				    "indices={} instances={} vs=0x{:016x} ps=0x{:016x} mrt={} cc_mode={} "
-				    "blend={} src={} dst={} comb={} ps_mask=0x{:x} mode0={} export0=0x{:02x} "
-				    "kill={} ps_active={}\n",
-				    draw.Name(), color.desc.info.data.address, slot, extent.width, extent.height,
-				    draw.index_count, draw.instance_count, vertex_id, pixel_id, mask, cc.mode,
-				    blend.enable ? "true" : "false", blend.color_srcblend, blend.color_destblend,
-				    blend.color_comb_fcn, state.ps_input_info.target_shader_mask,
-				    state.ps_input_info.target_output_mode[0], color.export_mapping.packed,
-				    state.ps_input_info.ps_pixel_kill_enable ? "true" : "false", state.ps_active));
-			}
+			// Blend, export and pixel-kill state decide whether a draw that reaches the
+			// surface also leaves something in it; the watch reports the snapshot with the
+			// pair it belongs to.
+			const auto&  blend  = ctx.GetBlendControl(color.target_slot);
+			const auto  extent = color.Extent();
+			FlipWatch::DrawSnapshot snapshot;
+			snapshot.address        = color.desc.info.data.address;
+			snapshot.index_count    = draw.index_count;
+			snapshot.instance_count = draw.instance_count;
+			snapshot.width          = extent.width;
+			snapshot.height         = extent.height;
+			snapshot.mrt_mask       = ctx.GetRenderTargetMask();
+			snapshot.ps_shader_mask = state.ps_input_info.target_shader_mask;
+			snapshot.mode0          = state.ps_input_info.target_output_mode[0];
+			snapshot.export0        = color.export_mapping.packed;
+			snapshot.cc_mode        = ctx.GetColorControl().mode;
+			snapshot.blend_enable   = blend.enable;
+			snapshot.blend_src      = blend.color_srcblend;
+			snapshot.blend_dst      = blend.color_destblend;
+			snapshot.blend_comb     = blend.color_comb_fcn;
+			snapshot.pixel_kill     = state.ps_input_info.ps_pixel_kill_enable;
+			snapshot.ps_active      = state.ps_active;
+			snapshot.name           = draw.Name();
+			watch.NoteDrawPair(vertex_id, pixel_id, snapshot);
 		}
 		if (any) {
 			watch.CountDraw();

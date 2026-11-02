@@ -95,6 +95,7 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   debug_depth_always          = false;
+	bool                   debug_blend_one             = false;
 	bool                   debug_sample_stats          = false;
 	bool                   debug_dump_flip             = false;
 	bool                   trophy_enabled              = true;
@@ -170,6 +171,7 @@ bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool DebugDepthAlwaysEnabled();
+bool DebugBlendOneEnabled();
 bool DebugSampleStatsEnabled();
 bool DebugDumpFlipEnabled();
 bool TrophyEnabled();

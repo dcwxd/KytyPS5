@@ -234,6 +234,7 @@ static constexpr Flag FLAGS[] = {
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif
     {"--debug-depth-always", &ConfigOptions::debug_depth_always},
+    {"--debug-blend-one", &ConfigOptions::debug_blend_one},
     {"--debug-sample-stats", &ConfigOptions::debug_sample_stats},
     {"--debug-dump-flip", &ConfigOptions::debug_dump_flip},
 };
