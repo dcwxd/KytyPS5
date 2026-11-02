@@ -10,7 +10,7 @@
 
 // A private static copy of the writer: targets that link the presentation window sources may do
 // it without src/libs, and kyty_emulator's link has shown it cannot rely on libPngEnc.cpp's
-// implementation either. With everything static there is no symbol to collide or to miss.
+// implementation either. With everything static there is no symbol to collide with or to miss.
 #define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -64,23 +64,39 @@ FlipDump::~FlipDump() {
 	}
 }
 
-void FlipDump::Capture(vk::CommandBuffer command, GraphicContext& graphics, vk::Image source,
-                       vk::Extent3D extent) {
-	if (!Config::DebugDumpFlipEnabled()) {
-		return;
+bool FlipDump::CaptureDue() const {
+	if (!Config::DebugDumpFlipEnabled() || m_pending) {
+		return false;
 	}
 	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-	if (m_last_capture_ns != 0 && now - m_last_capture_ns < kCapturePeriod) {
-		return;
+	return m_last_capture_ns == 0 || now - m_last_capture_ns >= kCapturePeriod;
+}
+
+bool FlipDump::Capture(vk::CommandBuffer command, GraphicContext& graphics, vk::Image source,
+                       vk::Extent3D extent) {
+	return CaptureCommon(command, graphics, source, 0, 0, extent, Kind::Flip);
+}
+
+bool FlipDump::CaptureRenderTarget(vk::CommandBuffer command, GraphicContext& graphics,
+                                   vk::Image source, uint32_t mip, uint32_t layer,
+                                   vk::Extent3D extent) {
+	return CaptureCommon(command, graphics, source, mip, layer, extent, Kind::RenderTarget);
+}
+
+bool FlipDump::CaptureCommon(vk::CommandBuffer command, GraphicContext& graphics, vk::Image source,
+                             uint32_t mip, uint32_t layer, vk::Extent3D extent, Kind kind) {
+	if (!CaptureDue()) {
+		return false;
 	}
-	if (m_pending || extent.width == 0 || extent.height == 0 || extent.width > 16384 ||
+	if (extent.width == 0 || extent.height == 0 || extent.width > 16384 ||
 	    extent.height > 16384) {
-		return;
+		return false;
 	}
 
 	m_device          = graphics.device;
 	m_extent          = vk::Extent2D(extent.width, extent.height);
-	m_last_capture_ns = now;
+	m_kind            = kind;
+	m_last_capture_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
 	const auto image_info = vk::ImageCreateInfo {
 	    .imageType   = vk::ImageType::e2D,
@@ -156,6 +172,8 @@ void FlipDump::Capture(vk::CommandBuffer command, GraphicContext& graphics, vk::
 	                        &to_dst);
 	vk::ImageBlit region {};
 	region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	region.srcSubresource.mipLevel       = mip;
+	region.srcSubresource.baseArrayLayer = layer;
 	region.srcSubresource.layerCount     = 1;
 	region.srcOffsets[1].x               = static_cast<int32_t>(extent.width);
 	region.srcOffsets[1].y               = static_cast<int32_t>(extent.height);
@@ -165,6 +183,8 @@ void FlipDump::Capture(vk::CommandBuffer command, GraphicContext& graphics, vk::
 	region.dstOffsets[1].x               = static_cast<int32_t>(extent.width);
 	region.dstOffsets[1].y               = static_cast<int32_t>(extent.height);
 	region.dstOffsets[1].z               = 1;
+	// The hardware blit converts the source format to 8-bit channels; sRGB sources are
+	// linearized on the way, and alpha-less targets blit into an alpha of one.
 	command.blitImage(source, vk::ImageLayout::eTransferSrcOptimal, staging,
 	                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eNearest);
 	vk::ImageMemoryBarrier to_src {
@@ -196,6 +216,7 @@ void FlipDump::Capture(vk::CommandBuffer command, GraphicContext& graphics, vk::
 	                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &to_host, 0,
 	                        nullptr);
 	m_pending = true;
+	return true;
 }
 
 void FlipDump::Finish(GraphicContext& graphics) {
@@ -207,41 +228,66 @@ void FlipDump::Finish(GraphicContext& graphics) {
 	Common::LockGuard lock(graphics.queue_mutex);
 	graphics.queue.waitIdle();
 
-	const uint64_t row_bytes = static_cast<uint64_t>(m_extent.width) * 4;
+	// Render-target dumps drop the alpha channel: scene targets legitimately leave it at zero,
+	// and viewers would otherwise show the color we are chasing as full transparency. Flip dumps
+	// keep it, since a transparent flip image is itself the finding.
+	const bool     is_flip    = m_kind == Kind::Flip;
+	const uint32_t components = is_flip ? 4u : 3u;
+	const uint64_t row_bytes  = static_cast<uint64_t>(m_extent.width) * components;
 	std::vector<uint8_t> packed;
 	const uint8_t* pixels = reinterpret_cast<const uint8_t*>(m_mapped);
-	if (m_row_pitch != row_bytes) {
+	if (is_flip && m_row_pitch != row_bytes) {
 		packed.resize(row_bytes * m_extent.height);
 		for (uint32_t row = 0; row < m_extent.height; row++) {
 			std::memcpy(packed.data() + row * row_bytes, pixels + row * m_row_pitch, row_bytes);
 		}
 		pixels = packed.data();
+	} else if (!is_flip) {
+		packed.resize(row_bytes * m_extent.height);
+		for (uint32_t row = 0; row < m_extent.height; row++) {
+			const uint8_t* src = pixels + row * m_row_pitch;
+			uint8_t*       dst = packed.data() + row * row_bytes;
+			for (uint32_t x = 0; x < m_extent.width; x++) {
+				std::memcpy(dst + x * 3u, src + x * 4u, 3u);
+			}
+		}
+		pixels = packed.data();
 	}
 
 	char name[32];
-	std::snprintf(name, sizeof(name), "flip_dump_%04u.png", m_dump_index++);
+	uint32_t index = 0;
+	const char* kind_text = "flip dump";
+	if (is_flip) {
+		index     = m_flip_index++;
+		std::snprintf(name, sizeof(name), "flip_dump_%04u.png", index);
+	} else {
+		index     = m_rt_index++;
+		kind_text = "rt dump";
+		std::snprintf(name, sizeof(name), "rt_dump_%04u.png", index);
+	}
 	const auto path     = Config::GetShaderLogFolder() / name;
 	const auto path_text = Common::PathToString(path);
 	Common::File::CreateDirectories(path.parent_path());
-	const int written =
-	    stbi_write_png(path_text.c_str(), static_cast<int>(m_extent.width),
-	                   static_cast<int>(m_extent.height), 4, pixels, static_cast<int>(row_bytes));
+	const int written = stbi_write_png(path_text.c_str(), static_cast<int>(m_extent.width),
+	                                   static_cast<int>(m_extent.height),
+	                                   static_cast<int>(components), pixels,
+	                                   static_cast<int>(row_bytes));
 	Log::WriteToConsoleAndLog(written != 0
-	                              ? fmt::format("flip dump: wrote {}\n", path_text)
-	                              : fmt::format("flip dump: failed to write {}\n", path_text));
+	                              ? fmt::format("{}: wrote {}\n", kind_text, path_text)
+	                              : fmt::format("{}: failed to write {}\n", kind_text, path_text));
 
 	m_device.unmapMemory(m_buffer_memory);
-	m_mapped      = nullptr;
+	m_mapped        = nullptr;
 	m_device.freeMemory(m_buffer_memory, nullptr);
 	m_buffer_memory = nullptr;
 	m_device.destroyBuffer(m_buffer, nullptr);
-	m_buffer = nullptr;
+	m_buffer        = nullptr;
 	m_device.freeMemory(m_image_memory, nullptr);
-	m_image_memory = nullptr;
+	m_image_memory  = nullptr;
 	m_device.destroyImage(m_image, nullptr);
-	m_image     = nullptr;
-	m_row_pitch = 0;
-	m_pending   = false;
+	m_image         = nullptr;
+	m_row_pitch     = 0;
+	m_pending       = false;
 }
 
 } // namespace Libs::Graphics

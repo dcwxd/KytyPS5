@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/rasterStats.h"
+#include "graphics/host_gpu/renderer/renderTargetPick.h"
 #include "kernel/eventQueue.h"
 
 #include <memory>
@@ -56,6 +57,7 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RasterSampleStats&  GetRasterSampleStats() { return m_raster_sample_stats; }
+	RenderTargetPick&   GetRenderTargetPick() { return m_render_target_pick; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -90,6 +92,7 @@ private:
 	ImageHeap                 m_image_heap;
 	OcclusionQueries          m_occlusion_queries;
 	RasterSampleStats         m_raster_sample_stats;
+	RenderTargetPick          m_render_target_pick;
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;

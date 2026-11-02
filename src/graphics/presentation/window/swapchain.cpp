@@ -315,8 +315,6 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
-	// Debug: snapshots of the guest flip image at the present blit.
-	FlipDump                       m_flip_dump;
 };
 
 struct Presenter::Impl {
@@ -335,6 +333,11 @@ struct Presenter::Impl {
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
 	}
+
+	// False when the pick no longer names a blittable single-sample color image; the caller
+	// then captures the flip picture instead.
+	[[nodiscard]] bool CaptureRenderTargetDump(const RenderTargetPick::Pick& pick,
+	                                           CommandBuffer&                buffer);
 
 	Image& ResolveSurface(const ImageInfo& info) {
 		TextureCache::ImageDesc desc {};
@@ -363,6 +366,12 @@ struct Presenter::Impl {
 	Swapchain             swapchain;
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
+	// Debug: --debug-dump-flip snapshots. Both captures record inside the guest render stream,
+	// where flips are prepared, instead of at the present blit: no other thread can have
+	// transitioned either image since.
+	FlipDump              flip_dump;
+	// Alternates capture turns between the flip picture and the picked render target.
+	bool                  dump_rt_turn = false;
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
@@ -794,8 +803,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
-	// The previous dump's commands have run by now; write its PNG before recording new ones.
-	m_flip_dump.Finish(m_window.graphic_ctx);
 	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
 	const bool blit_source     = source != nullptr && !convert_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
@@ -807,12 +814,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	if (convert_source) {
 		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                vk::AccessFlagBits2::eShaderRead);
-		static std::atomic_bool flip_dump_hdr_note = false;
-		if (Config::DebugDumpFlipEnabled() && !flip_dump_hdr_note.exchange(true)) {
-			Log::WriteToConsoleAndLog(
-			    "flip dump: HDR presents convert the image through a shader; snapshots of them "
-			    "are not captured yet\n");
-		}
 	}
 	if (draw_overlay) {
 		overlay.frame->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -876,8 +877,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
-		m_flip_dump.Capture(vk_command, m_window.graphic_ctx, source->image.image,
-		                    source->image.extent);
 	}
 
 	vk::ImageMemoryBarrier to_present {};
@@ -983,6 +982,45 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
+bool Presenter::Impl::CaptureRenderTargetDump(const RenderTargetPick::Pick& pick,
+                                              CommandBuffer&                buffer) {
+	auto* const image = renderer.GetTextureCache().TryGetImage(ImageId {pick.image_index});
+	if (image == nullptr || image->serial != pick.serial || image->backing.image == nullptr) {
+		return false;
+	}
+	// The pick filters for these, but the image may have been replaced between publish and
+	// capture; only single-sample color sources can blit to the staging image.
+	if (image->info.samples != 1 || image->info.pixel_format == vk::Format::eUndefined ||
+	    image->info.resources.levels == 0 || image->info.resources.layers == 0) {
+		return false;
+	}
+	const auto& features =
+	    window.graphic_ctx.GetFormatProperties(image->backing.format).optimalTilingFeatures;
+	if ((features & vk::FormatFeatureFlagBits::eBlitSrc) == vk::FormatFeatureFlags {}) {
+		return false;
+	}
+	const uint32_t mip   = std::min(pick.mip, image->info.resources.levels - 1u);
+	const uint32_t layer = std::min(pick.layer, image->info.resources.layers - 1u);
+	const uint32_t width =
+	    std::min(pick.width, std::max(image->backing.extent.width >> mip, 1u));
+	const uint32_t height =
+	    std::min(pick.height, std::max(image->backing.extent.height >> mip, 1u));
+	if (width == 0 || height == 0) {
+		return false;
+	}
+	// The blit records inside the guest render stream, sandwiched between transits of this one
+	// subresource, so the tracked state stays consistent for whatever renders next.
+	const ImageSubresourceRange range {mip, 1, layer, 1};
+	auto        command = buffer.Handle();
+	image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	               range, command);
+	const bool captured =
+	    flip_dump.CaptureRenderTarget(command, window.graphic_ctx, image->backing.image, mip,
+	                                  layer, vk::Extent3D {width, height, 1});
+	image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, command);
+	return captured;
+}
+
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
                                           bool headset) {
 	KYTY_PROFILER_FUNCTION();
@@ -1004,6 +1042,31 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	if (Config::DebugDumpFlipEnabled()) {
+		// The presenter frame now holds exactly what the present blit will show. Capturing it
+		// here, inside the render stream, means no other thread transitioned it in between;
+		// the previous capture's commands have run by the time this new one records.
+		m_impl->flip_dump.Finish(m_impl->window.graphic_ctx);
+		if (m_impl->flip_dump.CaptureDue()) {
+			const auto pick    = m_impl->renderer.GetRenderTargetPick().Take();
+			bool       captured = false;
+			if (m_impl->dump_rt_turn && pick.valid) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "rt dump: trying target address=0x{:016x} mip={} layer={} extent={}x{}\n",
+				    pick.address, pick.mip, pick.layer, pick.width, pick.height));
+				captured = m_impl->CaptureRenderTargetDump(pick, buffer);
+			}
+			// Alternate the kinds so render targets never starve behind flip captures; a
+			// render-target turn that found nothing blittable captures the flip instead.
+			m_impl->dump_rt_turn = !m_impl->dump_rt_turn;
+			if (!captured) {
+				frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+				               vk::AccessFlagBits2::eTransferRead);
+				m_impl->flip_dump.Capture(buffer.Handle(), m_impl->window.graphic_ctx,
+				                          frame->image.image, frame->image.extent);
+			}
+		}
+	}
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,

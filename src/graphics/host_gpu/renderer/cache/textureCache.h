@@ -63,6 +63,11 @@ public:
 		TouchImage(image);
 		return image;
 	}
+	// Slot-aware accessor with neither LRU touches nor the assumption that the id still
+	// lives; paths that recorded an id earlier use it to re-check identity by serial.
+	[[nodiscard]] Image*        TryGetImage(ImageId id) {
+		return m_slot_images.try_get(id);
+	}
 	void MarkGpuWritten(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,

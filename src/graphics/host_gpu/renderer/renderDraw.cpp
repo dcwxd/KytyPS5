@@ -961,6 +961,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 
 	CountDrawStats(false, false);
+	if (Config::DebugDumpFlipEnabled() && state.color_count > 0) {
+		// Debug: the flip dump's render-target half asks which color target this draw, which
+		// will actually render, writes the most pixels of the window.
+		m_context.GetRenderTargetPick().Publish(std::span {state.color_info, state.color_count},
+		                                        m_context.GetTextureCache());
+	}
 	return true;
 }
 
