@@ -1012,6 +1012,10 @@ bool Presenter::Impl::CaptureRenderTargetDump(const RenderTargetPick::Pick& pick
 	// subresource, so the tracked state stays consistent for whatever renders next.
 	const ImageSubresourceRange range {mip, 1, layer, 1};
 	auto        command = buffer.Handle();
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "rt dump: target address=0x{:016x} format={} extent={}x{} samples={} mip={} layer={}\n",
+	    pick.address, vk::to_string(image->backing.format), width, height, image->info.samples,
+	    mip, layer));
 	image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               range, command);
 	const bool captured =
@@ -1039,6 +1043,12 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
+	if (Config::DebugDumpFlipEnabled() &&
+	    m_impl->renderer.GetFlipWatch().Watch(image.serial)) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("flip watch: scan-out surface address=0x{:016x} serial=0x{:016x}\n",
+		                image.info.data.address, image.serial));
+	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
@@ -1048,12 +1058,22 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		// the previous capture's commands have run by the time this new one records.
 		m_impl->flip_dump.Finish(m_impl->window.graphic_ctx);
 		if (m_impl->flip_dump.CaptureDue()) {
-			const auto pick    = m_impl->renderer.GetRenderTargetPick().Take();
+			// The watch's report rides the same cadence: draws counted and per-shader-pair
+			// totals since the previous window.
+			auto& watch = m_impl->renderer.GetFlipWatch();
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "flip watch: {} draws into scan-out surfaces this window\n", watch.TakeDrawCount()));
+			watch.ReportPairs([](uint64_t vertex_id, uint64_t pixel_id, uint32_t draws) {
+				if (draws == 0) {
+					return;
+				}
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "flip watch: pair vs=0x{:016x} ps=0x{:016x} draws={}\n", vertex_id, pixel_id,
+				    draws));
+			});
+			const auto pick     = m_impl->renderer.GetRenderTargetPick().Take();
 			bool       captured = false;
 			if (m_impl->dump_rt_turn && pick.valid) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "rt dump: trying target address=0x{:016x} mip={} layer={} extent={}x{}\n",
-				    pick.address, pick.mip, pick.layer, pick.width, pick.height));
 				captured = m_impl->CaptureRenderTargetDump(pick, buffer);
 			}
 			// Alternate the kinds so render targets never starve behind flip captures; a

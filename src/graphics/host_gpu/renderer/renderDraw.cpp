@@ -964,8 +964,39 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (Config::DebugDumpFlipEnabled() && state.color_count > 0) {
 		// Debug: the flip dump's render-target half asks which color target this draw, which
 		// will actually render, writes the most pixels of the window.
+		auto& cache = m_context.GetTextureCache();
 		m_context.GetRenderTargetPick().Publish(std::span {state.color_info, state.color_count},
-		                                        m_context.GetTextureCache());
+		                                        cache);
+		// And the flip watch asks whether this draw writes one of the game's scan-out
+		// surfaces, the ones flips present.
+		auto&    watch = m_context.GetFlipWatch();
+		bool     any   = false;
+		for (uint32_t slot = 0; slot < state.color_count; slot++) {
+			const auto& color = state.color_info[slot];
+			const auto* image = cache.TryGetImage(color.image_id);
+			if (image == nullptr || watch.Match(image->serial) == FlipWatch::kNoMatch) {
+				continue;
+			}
+			any = true;
+			const auto  vertex_id =
+			    state.vertex_info[0].stage.module != nullptr
+			        ? state.vertex_info[0].stage.module->id
+			        : 0;
+			const auto  pixel_id = state.ps_input_info.stage.module != nullptr
+			                           ? state.ps_input_info.stage.module->id
+			                           : 0;
+			if (watch.NoteDrawPair(vertex_id, pixel_id)) {
+				const auto extent = color.Extent();
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "flip-draw: {} writes scan-out address=0x{:016x} slot={} extent={}x{} "
+				    "indices={} instances={} vs=0x{:016x} ps=0x{:016x}\n",
+				    draw.Name(), color.desc.info.data.address, slot, extent.width, extent.height,
+				    draw.index_count, draw.instance_count, vertex_id, pixel_id));
+			}
+		}
+		if (any) {
+			watch.CountDraw();
+		}
 	}
 	return true;
 }
@@ -1590,6 +1621,23 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	}
 
 	auto& cache = m_context.GetTextureCache();
+	if (Config::DebugDumpFlipEnabled()) {
+		// Debug: this color-control copy is the other shape a composite takes; one that
+		// lands on a scan-out surface interests the flip watch.
+		const auto* destination = cache.TryGetImage(dst.image_id);
+		if (destination != nullptr &&
+		    m_context.GetFlipWatch().Match(destination->serial) != FlipWatch::kNoMatch) {
+			const auto dst_extent = dst.Extent();
+			const auto src_extent = src.Extent();
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "flip-copy: color-control resolve into scan-out address=0x{:016x} extent={}x{} "
+			    "mip={} layer={} from address=0x{:016x} extent={}x{} mip={} layer={}\n",
+			    dst.desc.info.data.address, dst_extent.width, dst_extent.height,
+			    dst.desc.view_info.base_level, dst.desc.view_info.base_layer,
+			    src.desc.info.data.address, src_extent.width, src_extent.height,
+			    src.desc.view_info.base_level, src.desc.view_info.base_layer));
+		}
+	}
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
