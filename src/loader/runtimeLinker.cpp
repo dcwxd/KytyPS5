@@ -1201,6 +1201,10 @@ constexpr size_t kGuestHookRingSize = 64;
 
 struct GuestHookHit {
 	uint64_t    sequence = 0;
+	// Small stable id of the host thread that recorded the hit. Guest threads share the guest
+	// address space, and a recycled stack can put two different calls at the same rsp, so the id
+	// is what tells consecutive iterations apart from an interleaved call.
+	uint32_t    thread = 0;
 	uint64_t    function = 0;
 	uint64_t    return_address = 0;
 	uint64_t    rax = 0;
@@ -1243,7 +1247,17 @@ struct GuestHookHit {
 
 static std::array<GuestHookHit, kGuestHookRingSize> g_guest_hook_ring {};
 static std::atomic<uint64_t>                         g_guest_hook_total {0};
+static std::atomic<uint64_t>                         g_guest_hook_dropped {0};
 static std::atomic_flag                              g_guest_hook_lock = ATOMIC_FLAG_INIT;
+
+// Hits that lose the recording race are dropped, and a dropped hit does not consume a sequence
+// number, so the ring can never show a hole. The counter is the only way to tell whether two
+// neighbouring sequences are really neighbouring loop iterations.
+static uint32_t CurrentHookThreadId() {
+	static std::atomic<uint32_t>       next {0};
+	static const thread_local uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
+	return id;
+}
 
 static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registers,
                                void*                                     user_data) {
@@ -1251,11 +1265,13 @@ static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registe
 		return;
 	}
 	if (g_guest_hook_lock.test_and_set(std::memory_order_acquire)) {
+		g_guest_hook_dropped.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	const uint64_t sequence = g_guest_hook_total.load(std::memory_order_relaxed);
 	auto&          hit      = g_guest_hook_ring[sequence % g_guest_hook_ring.size()];
 	hit.sequence         = sequence;
+	hit.thread           = CurrentHookThreadId();
 	hit.function         = registers->function_address;
 	hit.return_address   = registers->return_address;
 	hit.rax              = registers->rax;
@@ -1319,7 +1335,8 @@ static void PrintOneGuestHookHit(const GuestHookHit& hit) {
 	uint64_t    caller_offset  = 0;
 	const bool  have_caller =
 	    linker->TryDescribeAddress(hit.return_address, &caller_module, &caller_offset);
-	std::printf("#%" PRIu64 " %s", hit.sequence, hit.name != nullptr ? hit.name->c_str() : "hook");
+	std::printf("#%" PRIu64 " t%u %s", hit.sequence, hit.thread,
+	            hit.name != nullptr ? hit.name->c_str() : "hook");
 	if (have_function) {
 		std::printf(" (%s+0x%" PRIx64 ")", module.c_str(), module_offset);
 	}
@@ -1386,20 +1403,24 @@ static void PrintOneGuestHookHit(const GuestHookHit& hit) {
 }
 
 static void PrintGuestHookHits() {
-	const uint64_t total = g_guest_hook_total.load(std::memory_order_acquire);
-	if (total == 0) {
+	const uint64_t total   = g_guest_hook_total.load(std::memory_order_acquire);
+	const uint64_t dropped = g_guest_hook_dropped.load(std::memory_order_acquire);
+	if (total == 0 && dropped == 0) {
 		return;
 	}
 	if (g_guest_hook_lock.test_and_set(std::memory_order_acquire)) {
-		std::printf("--- guest function hooks: %" PRIu64 " calls, ring busy ---\n", total);
+		std::printf("--- guest function hooks: %" PRIu64 " calls, %" PRIu64
+		            " dropped, ring busy ---\n",
+		            total, dropped);
 		return;
 	}
 	// Ring slots are addressed by sequence, not by array position: once the ring wrapped, the last
 	// entries sit at (total - n) % size, not at the end of the array.
 	const uint64_t retained = std::min<uint64_t>(total, g_guest_hook_ring.size());
 	const uint64_t shown    = std::min<uint64_t>(retained, 6);
-	std::printf("--- guest function hooks (%" PRIu64 " calls%s, last %" PRIu64 ") ---\n", total,
-	            total > retained ? ", older entries dropped" : "", shown);
+	std::printf("--- guest function hooks (%" PRIu64 " calls, %" PRIu64 " dropped%s, last %" PRIu64
+	            ") ---\n",
+	            total, dropped, total > retained ? ", older entries dropped" : "", shown);
 	for (uint64_t sequence = total - shown; sequence < total; sequence++) {
 		const auto& hit = g_guest_hook_ring[sequence % g_guest_hook_ring.size()];
 		if (hit.sequence != sequence) {
@@ -1449,11 +1470,22 @@ static void PrintGuestHookIterationTrace(const GuestHookHit& newest) {
 	};
 	for (size_t i = count; i > 0; i--) {
 		const auto& hit = *iterations[i - 1];
-		std::printf("   iter #%" PRIu64 " rsi=%08" PRIx32 "\n", hit.sequence,
+		std::printf("   iter #%" PRIu64 " t%u rsi=%08" PRIx32 "\n", hit.sequence, hit.thread,
 		            static_cast<uint32_t>(hit.rsi));
 		print_vector("ymm1  =", hit.vectors.data() + 1 * 32);
 		print_vector("ymm12 =", hit.vectors.data() + 12 * 32);
 		print_vector("ymm13 =", hit.vectors.data() + 13 * 32);
+	}
+	// Adjacent sequence numbers prove nothing about adjacency in time: a hit that loses the
+	// recording race is dropped without consuming a number. A different thread between two
+	// entries means the same rsp belongs to two interleaved calls.
+	for (size_t i = 1; i < count; i++) {
+		if (iterations[i]->thread != iterations[i - 1]->thread) {
+			std::printf("   (thread switch between #%" PRIu64 " and #%" PRIu64
+			            ": not consecutive iterations of one call)\n",
+			            iterations[i - 1]->sequence, iterations[i]->sequence);
+			break;
+		}
 	}
 }
 
