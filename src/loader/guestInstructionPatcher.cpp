@@ -12,6 +12,7 @@
 #include <array>
 #include <bitset>
 #include <climits>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1617,6 +1618,233 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		Common::VirtualMemory::FlushInstructionCache(trampoline_addr, trampoline_size);
 	}
 	return result;
+}
+
+namespace {
+
+// The hook trampoline builds one frame on the guest stack and keeps every register the host
+// callback may use there. The offsets double as the layout of GuestFunctionHookRegisters, so the
+// callback reads the guest state directly from the frame.
+constexpr int HookFrameR15        = 0x00;
+constexpr int HookFrameR14        = 0x08;
+constexpr int HookFrameR13        = 0x10;
+constexpr int HookFrameR12        = 0x18;
+constexpr int HookFrameR11        = 0x20;
+constexpr int HookFrameR10        = 0x28;
+constexpr int HookFrameR9         = 0x30;
+constexpr int HookFrameR8         = 0x38;
+constexpr int HookFrameRdi        = 0x40;
+constexpr int HookFrameRsi        = 0x48;
+constexpr int HookFrameRbp        = 0x50;
+constexpr int HookFrameRbx        = 0x58;
+constexpr int HookFrameRdx        = 0x60;
+constexpr int HookFrameRcx        = 0x68;
+constexpr int HookFrameRax        = 0x70;
+constexpr int HookFrameFlags      = 0x78;
+constexpr int HookFrameRsp        = 0x80;
+constexpr int HookFrameReturn     = 0x88;
+constexpr int HookFrameFunction   = 0x90;
+constexpr int HookFrameContinuation = 0x98;
+constexpr int HookFrameVector     = 0x100;
+// 16 vectors of 32 bytes, then padding so the frame keeps the guest stack 16-byte aligned.
+constexpr int HookFrameSize = HookFrameVector + 16 * 32 + 8;
+
+static_assert(HookFrameSize % 16 == 8, "the frame must leave rsp aligned for the host call");
+static_assert(offsetof(GuestFunctionHookRegisters, r15) == HookFrameR15);
+static_assert(offsetof(GuestFunctionHookRegisters, rdi) == HookFrameRdi);
+static_assert(offsetof(GuestFunctionHookRegisters, rflags) == HookFrameFlags);
+static_assert(offsetof(GuestFunctionHookRegisters, rsp) == HookFrameRsp);
+static_assert(offsetof(GuestFunctionHookRegisters, return_address) == HookFrameReturn);
+static_assert(offsetof(GuestFunctionHookRegisters, function_address) == HookFrameFunction);
+static_assert(offsetof(GuestFunctionHookRegisters, continuation) == HookFrameContinuation);
+
+bool HookUsesAvx() {
+	static const bool avx = [] {
+		const Xbyak::util::Cpu cpu;
+		return cpu.has(Xbyak::util::Cpu::tAVX);
+	}();
+	return avx;
+}
+
+} // namespace
+
+bool InstallGuestFunctionHook(uint64_t function_address, GuestFunctionHookCallback callback,
+                              void* user_data) {
+	if (function_address == 0 || callback == nullptr) {
+		return false;
+	}
+	auto* module = GetContainingModule(reinterpret_cast<void*>(function_address));
+	if (module == nullptr) {
+		return false;
+	}
+
+	std::unique_lock lock {module->mutex};
+	if (module->patched.contains(reinterpret_cast<u8*>(function_address))) {
+		return false;
+	}
+
+	// The jump overwrites whole instructions: decoding a prologue shorter than five bytes cannot
+	// be resumed, and a control-flow terminator inside such a prologue must not be skipped.
+	std::vector<DecodedCodeInstruction> prologue;
+	uintptr_t                           cursor = function_address;
+	while (cursor - function_address < NearJumpSize) {
+		auto decoded = DecodeCodeInstruction(cursor, reinterpret_cast<uintptr_t>(module->end));
+		if (decoded.instruction.length == 0) {
+			return false;
+		}
+		if (IsControlFlowTerminator(decoded.instruction) &&
+		    cursor - function_address + decoded.instruction.length < NearJumpSize) {
+			return false;
+		}
+		if (module->patched.contains(reinterpret_cast<u8*>(cursor))) {
+			return false;
+		}
+		prologue.push_back(decoded);
+		cursor += decoded.instruction.length;
+	}
+	const size_t patch_size = cursor - function_address;
+
+	auto&        trampoline       = module->trampoline_gen;
+	const size_t trampoline_begin = trampoline.getSize();
+	Xbyak::ClearError();
+
+	// Save the complete guest register file before the callback, including the vector registers:
+	// the hook runs at the function entry, where XMM arguments are still live, and the host ABI
+	// treats them as caller-saved.
+	trampoline.sub(rsp, HookFrameSize);
+	const auto save = [&](int offset, const Xbyak::Reg64& reg) {
+		trampoline.mov(ptr[rsp + offset], reg);
+	};
+	save(HookFrameR15, r15);
+	save(HookFrameR14, r14);
+	save(HookFrameR13, r13);
+	save(HookFrameR12, r12);
+	save(HookFrameR11, r11);
+	save(HookFrameR10, r10);
+	save(HookFrameR9, r9);
+	save(HookFrameR8, r8);
+	save(HookFrameRdi, rdi);
+	save(HookFrameRsi, rsi);
+	save(HookFrameRbp, rbp);
+	save(HookFrameRbx, rbx);
+	save(HookFrameRdx, rdx);
+	save(HookFrameRcx, rcx);
+	save(HookFrameRax, rax);
+	// A memory operand of push/pop needs an explicit size in Xbyak, and the flags word is stored
+	// through rax because it is already saved in the frame.
+	trampoline.pushfq();
+	trampoline.pop(rax);
+	trampoline.mov(ptr[rsp + HookFrameFlags], rax);
+	// The caller's return address and the guest stack pointer live above the frame.
+	trampoline.lea(rax, ptr[rsp + HookFrameSize]);
+	trampoline.mov(ptr[rsp + HookFrameRsp], rax);
+	trampoline.mov(rax, ptr[rax]);
+	trampoline.mov(ptr[rsp + HookFrameReturn], rax);
+	trampoline.mov(rax, function_address);
+	trampoline.mov(ptr[rsp + HookFrameFunction], rax);
+	trampoline.mov(rax, static_cast<uint64_t>(cursor));
+	trampoline.mov(ptr[rsp + HookFrameContinuation], rax);
+	const bool use_avx = HookUsesAvx();
+	for (int index = 0; index < 16; index++) {
+		if (use_avx) {
+			trampoline.vmovdqu(ptr[rsp + HookFrameVector + index * 32],
+			                   Xbyak::Ymm(index));
+		} else {
+			trampoline.movdqu(ptr[rsp + HookFrameVector + index * 16], Xbyak::Xmm(index));
+		}
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Microsoft x64: the frame pointer goes in rcx, the context in rdx, and the callee gets its
+	// 32-byte shadow space below the aligned stack pointer.
+	trampoline.mov(rcx, rsp);
+	trampoline.mov(rdx, reinterpret_cast<uint64_t>(user_data));
+	trampoline.sub(rsp, 0x20);
+	trampoline.mov(rax, reinterpret_cast<uint64_t>(callback));
+	trampoline.call(rax);
+	trampoline.add(rsp, 0x20);
+#else
+	// System V AMD64: frame in rdi, context in rsi; rsp is already 16-byte aligned for the call
+	// because the frame size is congruent to 8 modulo 16.
+	trampoline.mov(rdi, rsp);
+	trampoline.mov(rsi, reinterpret_cast<uint64_t>(user_data));
+	trampoline.mov(rax, reinterpret_cast<uint64_t>(callback));
+	trampoline.call(rax);
+#endif
+
+	// Restore the caller-visible state exactly, then run the instructions the jump overwrote.
+	for (int index = 0; index < 16; index++) {
+		if (use_avx) {
+			trampoline.vmovdqu(Xbyak::Ymm(index),
+			                   ptr[rsp + HookFrameVector + index * 32]);
+		} else {
+			trampoline.movdqu(Xbyak::Xmm(index), ptr[rsp + HookFrameVector + index * 16]);
+		}
+	}
+	const auto restore = [&](int offset, const Xbyak::Reg64& reg) {
+		trampoline.mov(reg, ptr[rsp + offset]);
+	};
+	restore(HookFrameR15, r15);
+	restore(HookFrameR14, r14);
+	restore(HookFrameR13, r13);
+	restore(HookFrameR12, r12);
+	restore(HookFrameR11, r11);
+	restore(HookFrameR10, r10);
+	restore(HookFrameR9, r9);
+	restore(HookFrameR8, r8);
+	restore(HookFrameRdi, rdi);
+	restore(HookFrameRsi, rsi);
+	restore(HookFrameRbp, rbp);
+	restore(HookFrameRbx, rbx);
+	restore(HookFrameRdx, rdx);
+	restore(HookFrameRcx, rcx);
+	// The flags word is reloaded through rax, so the guest rax goes back last.
+	trampoline.mov(rax, ptr[rsp + HookFrameFlags]);
+	trampoline.push(rax);
+	trampoline.popfq();
+	restore(HookFrameRax, rax);
+	trampoline.add(rsp, HookFrameSize);
+
+	bool encoded = true;
+	for (const auto& instruction: prologue) {
+		if (!EncodeRelocatedInstruction(instruction, trampoline)) {
+			encoded = false;
+			break;
+		}
+	}
+	if (encoded) {
+		trampoline.jmp(reinterpret_cast<void*>(cursor),
+		               Xbyak::CodeGenerator::LabelType::T_NEAR);
+	}
+	const int error = Xbyak::GetError();
+	if (!encoded || error != 0) {
+		trampoline.reset();
+		trampoline.setSize(trampoline_begin);
+		if (error != 0 && !HandleTrampolineError(module, error)) {
+			LOGF("Guest function hook trampoline generation failed at %p: %s\n",
+			     reinterpret_cast<void*>(function_address), Xbyak::ConvertErrorToString(error));
+		}
+		return false;
+	}
+	const uint64_t trampoline_address =
+	    reinterpret_cast<uint64_t>(trampoline.getCode()) + trampoline_begin;
+
+	auto& patch_gen = module->patch_gen;
+	patch_gen.reset();
+	patch_gen.setSize(function_address - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+	patch_gen.jmp(reinterpret_cast<void*>(trampoline_address),
+	              Xbyak::CodeGenerator::LabelType::T_NEAR);
+	patch_gen.nop(patch_size - NearJumpSize);
+	if (Xbyak::GetError() != 0) {
+		trampoline.reset();
+		trampoline.setSize(trampoline_begin);
+		return false;
+	}
+	module->patched.insert(reinterpret_cast<u8*>(function_address));
+	Common::VirtualMemory::FlushInstructionCache(function_address, patch_size);
+	Common::VirtualMemory::FlushInstructionCache(trampoline_address,
+	                                             trampoline.getSize() - trampoline_begin);
+	return true;
 }
 
 namespace {

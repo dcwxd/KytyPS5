@@ -4985,6 +4985,121 @@ void TestPackedReciprocalSquareRoot() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+namespace {
+
+struct GuestHookProbe {
+	int      calls              = 0;
+	uint64_t rdi                = 0;
+	uint64_t rsi                = 0;
+	uint64_t rdx                = 0;
+	uint64_t rsp                = 0;
+	uint64_t return_address     = 0;
+	uint64_t continuation       = 0;
+	bool     stack_has_return   = false;
+	bool     called_from_code   = false;
+};
+
+void GuestHookClobberVectors() {
+#if defined(__clang__) || defined(__GNUC__)
+	// The hook trampoline must save the vector file around the host callback: this runs at a
+	// function entry, where an XMM argument is still live.
+	__asm__ __volatile__("pxor %%xmm0, %%xmm0\n\t"
+	                     "pxor %%xmm1, %%xmm1\n\t"
+	                     "pxor %%xmm2, %%xmm2\n\t"
+	                     "pxor %%xmm3, %%xmm3\n\t" ::
+	                         : "xmm0", "xmm1", "xmm2", "xmm3");
+#endif
+}
+
+void GuestHookCallback(const Loader::GuestFunctionHookRegisters* registers, void* user_data) {
+	auto* probe                = static_cast<GuestHookProbe*>(user_data);
+	probe->calls++;
+	probe->rdi            = registers->rdi;
+	probe->rsi            = registers->rsi;
+	probe->rdx            = registers->rdx;
+	probe->rsp             = registers->rsp;
+	probe->return_address  = registers->return_address;
+	probe->continuation    = registers->continuation;
+	probe->stack_has_return =
+	    *reinterpret_cast<const uint64_t*>(registers->rsp) == registers->return_address;
+	GuestHookClobberVectors();
+}
+
+} // namespace
+
+void TestGuestFunctionHook() {
+	const char*        test      = "GuestFunctionHook";
+	constexpr uint64_t code_size = 0x4000;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x906000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "hook_test");
+	Check(test, mapping != 0, "failed to allocate hook test code");
+	InstructionTestScope restore {mapping, code_size * 2};
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+	                                            reinterpret_cast<void*>(mapping + code_size),
+	                                            code_size);
+
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+	Xbyak::Label         constant;
+	// push rbp (1) + mov rbp, rsp (3) is shorter than the jump, so the hook also relocates the
+	// RIP-relative addss: the constant must keep referring to the original address.
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.addss(Xbyak::Xmm(0), code.ptr[code.rip + constant]);
+	code.movss(code.ptr[code.rdx], Xbyak::Xmm(0));
+	code.mov(code.rax, code.rdi);
+	code.add(code.rax, code.rsi);
+	code.pop(code.rbp);
+	code.ret();
+	code.L(constant);
+	code.dd(0x3f800000);
+	Check(test, Xbyak::GetError() == 0, "failed to generate the hook fixture");
+
+	const std::array<uintptr_t, 1> starts {mapping};
+	// Hooks are installed after the instruction patches have consumed trampoline space, so the
+	// fixture patches first and only then asks for a hook.
+	Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, false, {}, 1);
+
+	GuestHookProbe probe;
+	Check(test, Loader::InstallGuestFunctionHook(mapping, GuestHookCallback, &probe),
+	      "failed to install the guest function hook");
+	Check(test, reinterpret_cast<const uint8_t*>(mapping)[0] == 0xe9,
+	      "the hook did not overwrite the entry with a near jump");
+	Check(test, !Loader::InstallGuestFunctionHook(mapping, GuestHookCallback, &probe),
+	      "a second hook overwrote the installed one");
+	Check(test, !Loader::InstallGuestFunctionHook(mapping + code_size, GuestHookCallback, &probe),
+	      "a hook was installed outside the registered module");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(uint64_t, uint64_t, float*, float);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	float      result   = 0.0f;
+	const auto value    = function(0x1234, 0x5678, &result, 2.5f);
+
+	Check(test, probe.calls == 1, "the hook callback was not invoked exactly once");
+	Check(test,
+	      probe.rdi == 0x1234 && probe.rsi == 0x5678 &&
+	          probe.rdx == reinterpret_cast<uint64_t>(&result),
+	      "the hook callback did not see the function arguments");
+	Check(test, probe.return_address != 0 && probe.stack_has_return,
+	      "the hook callback did not see the caller's return address");
+	Check(test, probe.continuation > mapping && probe.continuation <= mapping + 32,
+	      "the hook continuation did not skip the relocated prologue");
+	Check(test, value == 0x1234 + 0x5678, "the hook lost the integer arguments");
+	Check(test, std::abs(result - 3.5f) < 0.0001f,
+	      "the hook lost the XMM argument across the host callback");
+
+	function(1, 2, &result, 0.0f);
+	Check(test, probe.calls == 2 && result == 1.0f,
+	      "the hook trampoline did not survive a second call");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#else
+void TestGuestFunctionHook() {
+	std::printf("[host]    %-48s skipped\n", "GuestFunctionHook");
+}
+#endif
+
 void TestPackedBitField(bool insert) {
 	const char*        test      = insert ? "PackedBitFieldInsert" : "PackedBitFieldExtract";
 	constexpr uint64_t code_size = 0x80000;
@@ -6253,6 +6368,10 @@ int main(int argc, char** argv) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--guest-hook-only") == 0) {
+		RunTest(TestGuestFunctionHook);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
@@ -6270,6 +6389,7 @@ int main(int argc, char** argv) {
 	RunTest(TestPackedBitFieldInsert);
 	RunTest(TestCpuExtensionPatches);
 	RunTest(TestTimeStampCounterPatches);
+	RunTest(TestGuestFunctionHook);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);

@@ -1059,6 +1059,178 @@ static void PrintCodeWindow(const char* label, uint64_t address, int before, int
 	std::printf("\n");
 }
 
+// Optional function-entry hooks, requested with KYTY_GUEST_HOOKS as a comma separated list of
+// "offset" or "name=offset" values relative to the main executable base. The offset of a function
+// in eboot.bin is enough to see the arguments of every call without symbols.
+struct GuestHookSpec {
+	uint64_t    offset = 0;
+	std::string name;
+};
+
+static const std::vector<GuestHookSpec>& GetGuestHookSpecs() {
+	static const auto specs = [] {
+		std::vector<GuestHookSpec> result;
+		const char*                value = std::getenv("KYTY_GUEST_HOOKS");
+		if (value == nullptr) {
+			return result;
+		}
+		std::string text {value};
+		while (!text.empty() && result.size() < 16) {
+			const auto  comma = text.find(',');
+			std::string item  = text.substr(0, comma);
+			if (comma == std::string::npos) {
+				text.clear();
+			} else {
+				text.erase(0, comma + 1);
+			}
+			GuestHookSpec spec;
+			const auto    equals = item.find('=');
+			std::string   number = item;
+			if (equals != std::string::npos) {
+				spec.name = item.substr(0, equals);
+				number    = item.substr(equals + 1);
+			}
+			char*              end  = nullptr;
+			const unsigned long long offset = std::strtoull(number.c_str(), &end, 0);
+			if (end == number.c_str() || *end != '\0' || offset == 0) {
+				Log::WriteToConsoleAndLog(
+				    fmt::format("Guest hook: ignoring invalid entry '{}'\n", item));
+				continue;
+			}
+			spec.offset = offset;
+			if (spec.name.empty()) {
+				spec.name = fmt::format("+0x{:x}", offset);
+			}
+			result.push_back(std::move(spec));
+		}
+		return result;
+	}();
+	return specs;
+}
+
+// The hook callback runs on every call of a traced function, so it only copies the saved
+// registers into a lock-free ring. The fault report replays the newest entries without ever
+// waiting for the writer.
+constexpr size_t kGuestHookRingSize = 64;
+
+struct GuestHookHit {
+	uint64_t    sequence = 0;
+	uint64_t    function = 0;
+	uint64_t    return_address = 0;
+	uint64_t    rax = 0;
+	uint64_t    rbx = 0;
+	uint64_t    rcx = 0;
+	uint64_t    rdx = 0;
+	uint64_t    rsi = 0;
+	uint64_t    rdi = 0;
+	uint64_t    rbp = 0;
+	uint64_t    rsp = 0;
+	uint64_t    r8 = 0;
+	uint64_t    r9 = 0;
+	uint64_t    r12 = 0;
+	uint64_t    r13 = 0;
+	uint64_t    r14 = 0;
+	uint64_t    r15 = 0;
+	// First stack argument: at the entry of a SysV function it sits right above the return address.
+	uint64_t    stack_argument = 0;
+	const std::string* name = nullptr;
+};
+
+static std::array<GuestHookHit, kGuestHookRingSize> g_guest_hook_ring {};
+static std::atomic<uint64_t>                         g_guest_hook_total {0};
+static std::atomic_flag                              g_guest_hook_lock = ATOMIC_FLAG_INIT;
+
+static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registers,
+                               void*                                     user_data) {
+	if (registers == nullptr) {
+		return;
+	}
+	if (g_guest_hook_lock.test_and_set(std::memory_order_acquire)) {
+		return;
+	}
+	const uint64_t sequence = g_guest_hook_total.load(std::memory_order_relaxed);
+	auto&          hit      = g_guest_hook_ring[sequence % g_guest_hook_ring.size()];
+	hit.sequence         = sequence;
+	hit.function         = registers->function_address;
+	hit.return_address   = registers->return_address;
+	hit.rax              = registers->rax;
+	hit.rbx              = registers->rbx;
+	hit.rcx              = registers->rcx;
+	hit.rdx              = registers->rdx;
+	hit.rsi              = registers->rsi;
+	hit.rdi              = registers->rdi;
+	hit.rbp              = registers->rbp;
+	hit.rsp              = registers->rsp;
+	hit.r8               = registers->r8;
+	hit.r9               = registers->r9;
+	hit.r12              = registers->r12;
+	hit.r13              = registers->r13;
+	hit.r14              = registers->r14;
+	hit.r15              = registers->r15;
+	hit.stack_argument   = reinterpret_cast<const uint64_t*>(registers->rsp)[1];
+	hit.name             = static_cast<const std::string*>(user_data);
+	g_guest_hook_total.store(sequence + 1, std::memory_order_release);
+	g_guest_hook_lock.clear(std::memory_order_release);
+}
+
+static void PrintGuestHookHits() {
+	const uint64_t total = g_guest_hook_total.load(std::memory_order_acquire);
+	if (total == 0) {
+		return;
+	}
+	if (g_guest_hook_lock.test_and_set(std::memory_order_acquire)) {
+		std::printf("--- guest function hooks: %" PRIu64 " calls, ring busy ---\n", total);
+		return;
+	}
+	const uint64_t available = std::min<uint64_t>(total, g_guest_hook_ring.size());
+	const uint64_t shown     = std::min<uint64_t>(available, 6);
+	std::printf("--- guest function hooks (%" PRIu64 " calls%s, last %" PRIu64 ") ---\n", total,
+	            total > available ? ", older entries dropped" : "", shown);
+	for (uint64_t i = available - shown; i < available; i++) {
+		const auto& hit     = g_guest_hook_ring[i % g_guest_hook_ring.size()];
+		auto*       linker  = Common::Singleton<RuntimeLinker>::Instance();
+		std::string module;
+		uint64_t    module_offset  = 0;
+		const bool  have_function  = linker->TryDescribeAddress(hit.function, &module, &module_offset);
+		std::string caller_module;
+		uint64_t    caller_offset  = 0;
+		const bool  have_caller =
+		    linker->TryDescribeAddress(hit.return_address, &caller_module, &caller_offset);
+		std::printf("#%" PRIu64 " %s", hit.sequence,
+		            hit.name != nullptr ? hit.name->c_str() : "hook");
+		if (have_function) {
+			std::printf(" (%s+0x%" PRIx64 ")", module.c_str(), module_offset);
+		}
+		std::printf(" ret ");
+		if (have_caller) {
+			std::printf("%s+0x%" PRIx64 "\n", caller_module.c_str(), caller_offset);
+		} else {
+			std::printf("0x%" PRIx64 "\n", hit.return_address);
+		}
+		std::printf("   rdi=%016" PRIx64 " rsi=%016" PRIx64 " rdx=%016" PRIx64
+		            " rcx=%016" PRIx64 " r8=%016" PRIx64 " r9=%016" PRIx64 "\n",
+		            hit.rdi, hit.rsi, hit.rdx, hit.rcx, hit.r8, hit.r9);
+		std::printf("   r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64
+		            " r15=%016" PRIx64 " rsp=%016" PRIx64 " [rsp+8]=%016" PRIx64 "\n",
+		            hit.r12, hit.r13, hit.r14, hit.r15, hit.rsp, hit.stack_argument);
+	}
+	g_guest_hook_lock.clear(std::memory_order_release);
+}
+
+static void InstallGuestHooks(uint64_t base_vaddr) {
+	for (const auto& spec: GetGuestHookSpecs()) {
+		const uint64_t address = base_vaddr + spec.offset;
+		if (Loader::InstallGuestFunctionHook(address, RecordGuestHookHit,
+		                                     const_cast<std::string*>(&spec.name))) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest hook: {} installed at base+0x{:x}\n", spec.name, spec.offset));
+		} else {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest hook: {} could not be installed at base+0x{:x}\n", spec.name, spec.offset));
+		}
+	}
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -1283,6 +1455,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 		}
+		PrintGuestHookHits();
 		std::fflush(stdout);
 		PrintRecentMemoryCalls(info->access_violation_vaddr, access_base);
 		PrintRecentRangeChanges();
@@ -2309,8 +2482,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #endif
 	const uint64_t tsc_multiplier =
 	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
-	const bool patch_guest_instructions =
-	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
+	// Function entry hooks need the same trampoline area as the instruction patches, and their
+	// offsets are relative to the main executable only.
+	const bool guest_hooks_enabled = !is_shared && !GetGuestHookSpecs().empty();
+	const bool patch_guest_instructions = protect_memory_faults || emulate_amd ||
+	                                      tsc_multiplier != 0 || guest_hooks_enabled;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -2483,6 +2659,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
+	}
+
+	if (guest_hooks_enabled) {
+		InstallGuestHooks(program->base_vaddr);
 	}
 
 	if (!is_shared) {
