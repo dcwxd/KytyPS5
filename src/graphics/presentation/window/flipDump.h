@@ -37,11 +37,17 @@ public:
 	                                       vk::Image source, uint32_t mip, uint32_t layer,
 	                                       vk::Extent3D extent);
 
+	// Same for the image a composite reads; dump files and log lines say "input" so scene
+	// targets and their color sources stay distinct.
+	[[nodiscard]] bool CaptureRenderInput(vk::CommandBuffer command, GraphicContext& graphics,
+	                                      vk::Image source, uint32_t mip, uint32_t layer,
+	                                      vk::Extent3D extent);
+
 	// Waits for the queue, then writes the previous capture to disk.
 	void Finish(GraphicContext& graphics);
 
 private:
-	enum class Kind : uint8_t { Flip, RenderTarget };
+	enum class Kind : uint8_t { Flip, RenderTarget, RenderInput };
 
 	bool CaptureCommon(vk::CommandBuffer command, GraphicContext& graphics, vk::Image source,
 	                   uint32_t mip, uint32_t layer, vk::Extent3D extent, Kind kind);
@@ -57,6 +63,7 @@ private:
 	Kind             m_kind {};
 	uint32_t         m_flip_index {};
 	uint32_t         m_rt_index {};
+	uint32_t         m_input_index {};
 	bool             m_pending {};
 	uint64_t         m_last_capture_ns {};
 };

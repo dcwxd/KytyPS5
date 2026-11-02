@@ -94,6 +94,38 @@ public:
 		return pick;
 	}
 
+	// A second window, overlapping the first: the largest image an unblended screen-quad draw
+	// read -- the composite's color source, as opposed to the targets draws wrote. Last
+	// publisher wins; the pair registry publishes fresh every window.
+	void PublishInput(uint64_t serial, uint64_t address, uint32_t image_index, uint32_t width,
+	                  uint32_t height, uint32_t mip, uint32_t layer) {
+		if (serial == 0 || width == 0 || height == 0 || width > 0xffffu || height > 0xffffu ||
+		    mip > 0xffffu || layer > 0xffffu) {
+			return;
+		}
+		m_input_serial.store(serial, std::memory_order_relaxed);
+		m_input_address.store(address, std::memory_order_relaxed);
+		m_input_slot.store(image_index + 1u, std::memory_order_relaxed);
+		m_input_wh.store((width << 16u) | height, std::memory_order_relaxed);
+		m_input_ml.store((mip << 16u) | layer, std::memory_order_relaxed);
+	}
+
+	[[nodiscard]] Pick TakeInput() {
+		Pick pick {};
+		const auto slot   = m_input_slot.exchange(0, std::memory_order_relaxed);
+		const auto wh     = m_input_wh.exchange(0, std::memory_order_relaxed);
+		pick.serial       = m_input_serial.exchange(0, std::memory_order_relaxed);
+		pick.address      = m_input_address.exchange(0, std::memory_order_relaxed);
+		const auto ml     = m_input_ml.exchange(0, std::memory_order_relaxed);
+		pick.image_index  = slot != 0 ? slot - 1u : pick.image_index;
+		pick.width        = wh >> 16u;
+		pick.height       = wh & 0xffffu;
+		pick.mip          = ml >> 16u;
+		pick.layer        = ml & 0xffffu;
+		pick.valid        = slot != 0 && pick.serial != 0 && pick.width != 0;
+		return pick;
+	}
+
 private:
 	std::atomic<uint64_t> m_best_pixels {0};
 	std::atomic<uint64_t> m_serial {0};
@@ -101,6 +133,11 @@ private:
 	std::atomic<uint32_t> m_image_slot {0};
 	std::atomic<uint32_t> m_packed_wh {0};
 	std::atomic<uint32_t> m_packed_ml {0};
+	std::atomic<uint64_t> m_input_serial {0};
+	std::atomic<uint64_t> m_input_address {0};
+	std::atomic<uint32_t> m_input_slot {0};
+	std::atomic<uint32_t> m_input_wh {0};
+	std::atomic<uint32_t> m_input_ml {0};
 };
 
 } // namespace Libs::Graphics

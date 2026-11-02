@@ -337,7 +337,7 @@ struct Presenter::Impl {
 	// False when the pick no longer names a blittable single-sample color image; the caller
 	// then captures the flip picture instead.
 	[[nodiscard]] bool CaptureRenderTargetDump(const RenderTargetPick::Pick& pick,
-	                                           CommandBuffer&                buffer);
+	                                           CommandBuffer& buffer, bool input);
 
 	Image& ResolveSurface(const ImageInfo& info) {
 		TextureCache::ImageDesc desc {};
@@ -372,6 +372,9 @@ struct Presenter::Impl {
 	FlipDump              flip_dump;
 	// Alternates capture turns between the flip picture and the picked render target.
 	bool                  dump_rt_turn = false;
+	// Within render-target turns, alternates the frame's biggest color target with the
+	// composite's biggest read -- the input that its output should come from.
+	bool                  dump_input_turn = false;
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
@@ -983,7 +986,7 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 Presenter::~Presenter() = default;
 
 bool Presenter::Impl::CaptureRenderTargetDump(const RenderTargetPick::Pick& pick,
-                                              CommandBuffer&                buffer) {
+                                              CommandBuffer& buffer, bool input) {
 	auto* const image = renderer.GetTextureCache().TryGetImage(ImageId {pick.image_index});
 	if (image == nullptr || image->serial != pick.serial || image->backing.image == nullptr) {
 		return false;
@@ -1011,17 +1014,20 @@ bool Presenter::Impl::CaptureRenderTargetDump(const RenderTargetPick::Pick& pick
 	// The blit records inside the guest render stream, sandwiched between transits of this one
 	// subresource, so the tracked state stays consistent for whatever renders next.
 	const ImageSubresourceRange range {mip, 1, layer, 1};
-	auto        command = buffer.Handle();
+	auto        command   = buffer.Handle();
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "rt dump: target address=0x{:016x} format={} extent={}x{} samples={} mip={} layer={} "
+	    "{}: {} address=0x{:016x} format={} extent={}x{} samples={} mip={} layer={} "
 	    "serial=0x{:016x}\n",
-	    pick.address, vk::to_string(image->backing.format), width, height, image->info.samples,
-	    mip, layer, image->serial));
+	    input ? "rt input dump" : "rt dump",
+	    input ? "source" : "target", pick.address, vk::to_string(image->backing.format), width,
+	    height, image->info.samples, mip, layer, image->serial));
 	image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               range, command);
 	const bool captured =
-	    flip_dump.CaptureRenderTarget(command, window.graphic_ctx, image->backing.image, mip,
-	                                  layer, vk::Extent3D {width, height, 1});
+	    input ? flip_dump.CaptureRenderInput(command, window.graphic_ctx, image->backing.image,
+	                                         mip, layer, vk::Extent3D {width, height, 1})
+	          : flip_dump.CaptureRenderTarget(command, window.graphic_ctx, image->backing.image,
+	                                      mip, layer, vk::Extent3D {width, height, 1});
 	image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, command);
 	return captured;
 }
@@ -1089,10 +1095,22 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			    "flip watch: {} draws into scan-out this window, {} dropped no-vertex-stage "
 			    "targeting scan-out, {} skipped empty-fb targeting scan-out\n",
 			    flip_draws, dropped, skipped));
-			const auto pick     = m_impl->renderer.GetRenderTargetPick().Take();
+			auto&      registry = m_impl->renderer.GetRenderTargetPick();
+			const auto pick     = registry.Take();
+			const auto input    = registry.TakeInput();
 			bool       captured = false;
-			if (m_impl->dump_rt_turn && pick.valid) {
-				captured = m_impl->CaptureRenderTargetDump(pick, buffer);
+			if (m_impl->dump_rt_turn) {
+				// Every other render-target turn dumps the composite's biggest read instead of
+				// the frame's biggest written target; together they say whether the color the
+				// composite sees was ever written.
+				if (m_impl->dump_input_turn) {
+					if (input.valid) {
+						captured = m_impl->CaptureRenderTargetDump(input, buffer, true);
+					}
+				} else if (pick.valid) {
+					captured = m_impl->CaptureRenderTargetDump(pick, buffer, false);
+				}
+				m_impl->dump_input_turn = !m_impl->dump_input_turn;
 			}
 			// Alternate the kinds so render targets never starve behind flip captures; a
 			// render-target turn that found nothing blittable captures the flip instead.

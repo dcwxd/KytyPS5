@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -81,6 +82,12 @@ bool FlipDump::CaptureRenderTarget(vk::CommandBuffer command, GraphicContext& gr
                                    vk::Image source, uint32_t mip, uint32_t layer,
                                    vk::Extent3D extent) {
 	return CaptureCommon(command, graphics, source, mip, layer, extent, Kind::RenderTarget);
+}
+
+bool FlipDump::CaptureRenderInput(vk::CommandBuffer command, GraphicContext& graphics,
+                                  vk::Image source, uint32_t mip, uint32_t layer,
+                                  vk::Extent3D extent) {
+	return CaptureCommon(command, graphics, source, mip, layer, extent, Kind::RenderInput);
 }
 
 bool FlipDump::CaptureCommon(vk::CommandBuffer command, GraphicContext& graphics, vk::Image source,
@@ -228,12 +235,13 @@ void FlipDump::Finish(GraphicContext& graphics) {
 	Common::LockGuard lock(graphics.queue_mutex);
 	graphics.queue.waitIdle();
 
-	// Render-target dumps drop the alpha channel: scene targets legitimately leave it at zero,
-	// and viewers would otherwise show the color we are chasing as full transparency. Flip dumps
-	// keep it, since a transparent flip image is itself the finding.
-	const bool     is_flip    = m_kind == Kind::Flip;
-	const uint32_t components = is_flip ? 4u : 3u;
-	const uint64_t row_bytes  = static_cast<uint64_t>(m_extent.width) * components;
+	// Render-target and input dumps drop the alpha channel: scene targets legitimately leave
+	// it at zero, and viewers would otherwise show the color we are chasing as full
+	// transparency. Flip dumps keep it, since a transparent flip image is itself the finding.
+	const bool     is_flip      = m_kind == Kind::Flip;
+	const bool     is_input     = m_kind == Kind::RenderInput;
+	const uint32_t components   = is_flip ? 4u : 3u;
+	const uint64_t row_bytes    = static_cast<uint64_t>(m_extent.width) * components;
 	std::vector<uint8_t> packed;
 	const uint8_t* pixels = reinterpret_cast<const uint8_t*>(m_mapped);
 	if (is_flip && m_row_pitch != row_bytes) {
@@ -260,6 +268,10 @@ void FlipDump::Finish(GraphicContext& graphics) {
 	if (is_flip) {
 		index     = m_flip_index++;
 		std::snprintf(name, sizeof(name), "flip_dump_%04u.png", index);
+	} else if (is_input) {
+		index     = m_input_index++;
+		kind_text = "rt input dump";
+		std::snprintf(name, sizeof(name), "rt_input_%04u.png", index);
 	} else {
 		index     = m_rt_index++;
 		kind_text = "rt dump";
@@ -272,9 +284,19 @@ void FlipDump::Finish(GraphicContext& graphics) {
 	                                   static_cast<int>(m_extent.height),
 	                                   static_cast<int>(components), pixels,
 	                                   static_cast<int>(row_bytes));
+	// A 1x1 dump is its own first texel; the numbers say exposure-style inputs directly.
+	std::string texel_line;
+	if (!is_flip && m_extent.width == 1 && m_extent.height == 1 && pixels != nullptr) {
+		texel_line = fmt::format(" first texel rgb=[{},{},{}]",
+		                         static_cast<unsigned>(pixels[0]),
+		                         static_cast<unsigned>(pixels[1]),
+		                         static_cast<unsigned>(pixels[2]));
+	}
 	Log::WriteToConsoleAndLog(written != 0
-	                              ? fmt::format("{}: wrote {}\n", kind_text, path_text)
-	                              : fmt::format("{}: failed to write {}\n", kind_text, path_text));
+	                              ? fmt::format("{}: wrote {}{}\n", kind_text, path_text,
+	                                            texel_line)
+	                              : fmt::format("{}: failed to write {}\n", kind_text,
+	                                            path_text));
 
 	m_device.unmapMemory(m_buffer_memory);
 	m_mapped        = nullptr;

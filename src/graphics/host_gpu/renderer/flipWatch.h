@@ -214,6 +214,11 @@ public:
 		}
 	}
 
+	// The pair's first-draw state, for callers deciding what a pair is from its shape.
+	[[nodiscard]] const Pair* PairForSlot(uint32_t slot) const {
+		return slot < kPairSlots && m_pairs[slot].seen ? &m_pairs[slot] : nullptr;
+	}
+
 private:
 	std::array<std::atomic<uint64_t>, kSurfaceSlots> m_serials {};
 	std::array<std::atomic<uint64_t>, kSurfaceSlots> m_begins  {};

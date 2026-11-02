@@ -1226,7 +1226,21 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 	if (slot >= FlipWatch::kPairSlots || !context.GetFlipWatch().TakeBindLog(slot)) {
 		return;
 	}
-	auto& cache = context.GetTextureCache();
+	auto&       cache   = context.GetTextureCache();
+	auto&       picks   = context.GetRenderTargetPick();
+	const auto* pair    = context.GetFlipWatch().PairForSlot(slot);
+	// The composite's shape: an unblended screen-covering quad. Its biggest read is the color
+	// source the flips should carry.
+	const bool composite_shape =
+	    pair != nullptr && !pair->blend_enable && pair->first_index_count <= 6;
+	uint64_t best_pixels  = 0;
+	uint64_t best_serial  = 0;
+	uint64_t best_address = 0;
+	uint32_t best_index   = 0;
+	uint32_t best_width   = 0;
+	uint32_t best_height  = 0;
+	uint32_t best_mip     = 0;
+	uint32_t best_layer   = 0;
 	for (const PreparedBindings* stage: stages) {
 		if (stage == nullptr) {
 			continue;
@@ -1238,6 +1252,20 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 			const auto* resolved = cache.TryGetImage(image.image_id);
 			if (resolved == nullptr) {
 				continue;
+			}
+			if (composite_shape) {
+				const auto  ex      = image.desc.info.extent;
+				const auto  pixels = static_cast<uint64_t>(ex.width) * ex.height;
+				if (pixels > best_pixels) {
+					best_pixels  = pixels;
+					best_serial  = resolved->serial;
+					best_address = image.desc.info.data.address;
+					best_index   = image.image_id.index;
+					best_width   = ex.width;
+					best_height  = ex.height;
+					best_mip     = image.desc.view_info.base_level;
+					best_layer   = image.desc.view_info.base_layer;
+				}
 			}
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "flip-bind: pair slot={} desc addr=0x{:016x} size=0x{:x} fmt={} type={} view "
@@ -1254,6 +1282,10 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 			    resolved->info.resources.layers, resolved->IsGpuModified() ? "true" : "false",
 			    resolved->usage.video_out ? "true" : "false"));
 		}
+	}
+	if (composite_shape && best_pixels != 0) {
+		picks.PublishInput(best_serial, best_address, best_index, best_width, best_height,
+		                   best_mip, best_layer);
 	}
 }
 
