@@ -233,6 +233,7 @@ static constexpr Flag FLAGS[] = {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif
+    {"--debug-depth-always", &ConfigOptions::debug_depth_always},
 };
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {

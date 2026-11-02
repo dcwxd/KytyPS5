@@ -24,7 +24,11 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 	}
 	if (depth_test_enabled && dirty_state.depth_compare_op) {
 		dirty_state.depth_compare_op = false;
-		cmdbuf.setDepthCompareOp(depth_compare_op);
+		// Debug experiment: force every depth comparison to pass. A world that appears with this
+		// flag (overlapping or inside-out, painter's-order artifacts expected) proves the guest's
+		// depth data or the depth-state translation kills all fragments before shading.
+		cmdbuf.setDepthCompareOp(Config::DebugDepthAlwaysEnabled() ? vk::CompareOp::eAlways
+		                                                          : depth_compare_op);
 	}
 	if (dirty_state.depth_bounds_test_enabled) {
 		dirty_state.depth_bounds_test_enabled = false;

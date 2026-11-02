@@ -213,6 +213,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+bool DebugDepthAlwaysEnabled() {
+	return g_config->debug_depth_always;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
