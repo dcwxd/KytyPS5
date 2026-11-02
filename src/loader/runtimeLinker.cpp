@@ -1202,6 +1202,11 @@ struct GuestHookHit {
 	uint64_t    stack_argument = 0;
 	// The five stack arguments: the return address is at [rsp], so arguments start at [rsp+8].
 	uint64_t    stack_arguments[5] {};
+	// A copy of the surface descriptor taken at entry. The copy loop writes its results over the
+	// live descriptor, so by the time the fault report runs only this snapshot still shows the
+	// fields that produced the bad offset.
+	uint32_t descriptor[32] {};
+	bool     have_descriptor = false;
 	// XMM/YMM registers 0..15 at the hook point, 32 bytes each (low half zero when no AVX).
 	std::array<uint8_t, 16 * 32> vectors {};
 	const std::string* name = nullptr;
@@ -1243,6 +1248,12 @@ static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registe
 	for (size_t i = 0; i < 5; i++) {
 		hit.stack_arguments[i] = stack[i + 1];
 	}
+	hit.have_descriptor = false;
+	if (registers->rdx != 0 && IsReadableRange(registers->rdx, sizeof(hit.descriptor))) {
+		std::memcpy(hit.descriptor, reinterpret_cast<const void*>(registers->rdx),
+		            sizeof(hit.descriptor));
+		hit.have_descriptor = true;
+	}
 	const size_t vector_stride = Loader::GuestFunctionHookVectorStride();
 	hit.vectors.fill(0);
 	for (size_t i = 0; i < 16; i++) {
@@ -1254,6 +1265,60 @@ static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registe
 	g_guest_hook_lock.clear(std::memory_order_release);
 }
 
+static void PrintOneGuestHookHit(const GuestHookHit& hit) {
+	auto*       linker  = Common::Singleton<RuntimeLinker>::Instance();
+	std::string module;
+	uint64_t    module_offset  = 0;
+	const bool  have_function  = linker->TryDescribeAddress(hit.function, &module, &module_offset);
+	std::string caller_module;
+	uint64_t    caller_offset  = 0;
+	const bool  have_caller =
+	    linker->TryDescribeAddress(hit.return_address, &caller_module, &caller_offset);
+	std::printf("#%" PRIu64 " %s", hit.sequence, hit.name != nullptr ? hit.name->c_str() : "hook");
+	if (have_function) {
+		std::printf(" (%s+0x%" PRIx64 ")", module.c_str(), module_offset);
+	}
+	std::printf(" ret ");
+	if (have_caller) {
+		std::printf("%s+0x%" PRIx64 "\n", caller_module.c_str(), caller_offset);
+	} else {
+		std::printf("0x%" PRIx64 "\n", hit.return_address);
+	}
+	std::printf("   rdi=%016" PRIx64 " rsi=%016" PRIx64 " rdx=%016" PRIx64 " rcx=%016" PRIx64
+	            " r8=%016" PRIx64 " r9=%016" PRIx64 "\n",
+	            hit.rdi, hit.rsi, hit.rdx, hit.rcx, hit.r8, hit.r9);
+	std::printf("   r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64
+	            " rsp=%016" PRIx64 " [rsp+8]=%016" PRIx64 "\n",
+	            hit.r12, hit.r13, hit.r14, hit.r15, hit.rsp, hit.stack_argument);
+	std::printf("   stack args: %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+	            " %016" PRIx64 "\n",
+	            hit.stack_arguments[0], hit.stack_arguments[1], hit.stack_arguments[2],
+	            hit.stack_arguments[3], hit.stack_arguments[4]);
+	const auto print_dwords = [](const char* label, const uint8_t* data, int count) {
+		std::printf("   %s", label);
+		for (int i = 0; i < count; i++) {
+			uint32_t value = 0;
+			std::memcpy(&value, data + i * 4, sizeof(value));
+			std::printf("%s%08" PRIx32, (i % 8 == 0) ? "\n    " : " ", value);
+		}
+		std::printf("\n");
+	};
+	// The tiled-copy helper takes its increment vector in ymm0, the index vector in ymm1 and the
+	// surface descriptor in rdx; together they feed every offset the loop computes.
+	print_dwords("ymm0 at entry:", hit.vectors.data() + 0 * 32, 8);
+	print_dwords("ymm1 (indices) at entry:", hit.vectors.data() + 1 * 32, 8);
+	print_dwords("ymm4 at entry:", hit.vectors.data() + 4 * 32, 8);
+	if (hit.have_descriptor) {
+		const auto label = fmt::format("descriptor at entry rdx={:016x}:", hit.rdx);
+		print_dwords(label.c_str(), reinterpret_cast<const uint8_t*>(hit.descriptor), 32);
+	} else if (IsReadableRange(hit.rdx, 0x80)) {
+		const auto label = fmt::format("descriptor rdx={:016x}:", hit.rdx);
+		print_dwords(label.c_str(), reinterpret_cast<const uint8_t*>(hit.rdx), 32);
+	} else {
+		std::printf("   descriptor rdx=%016" PRIx64 " (not mapped)\n", hit.rdx);
+	}
+}
+
 static void PrintGuestHookHits() {
 	const uint64_t total = g_guest_hook_total.load(std::memory_order_acquire);
 	if (total == 0) {
@@ -1263,61 +1328,41 @@ static void PrintGuestHookHits() {
 		std::printf("--- guest function hooks: %" PRIu64 " calls, ring busy ---\n", total);
 		return;
 	}
-	const uint64_t available = std::min<uint64_t>(total, g_guest_hook_ring.size());
-	const uint64_t shown     = std::min<uint64_t>(available, 6);
+	// Ring slots are addressed by sequence, not by array position: once the ring wrapped, the last
+	// entries sit at (total - n) % size, not at the end of the array.
+	const uint64_t retained = std::min<uint64_t>(total, g_guest_hook_ring.size());
+	const uint64_t shown    = std::min<uint64_t>(retained, 6);
 	std::printf("--- guest function hooks (%" PRIu64 " calls%s, last %" PRIu64 ") ---\n", total,
-	            total > available ? ", older entries dropped" : "", shown);
-	for (uint64_t i = available - shown; i < available; i++) {
-		const auto& hit     = g_guest_hook_ring[i % g_guest_hook_ring.size()];
-		auto*       linker  = Common::Singleton<RuntimeLinker>::Instance();
-		std::string module;
-		uint64_t    module_offset  = 0;
-		const bool  have_function  = linker->TryDescribeAddress(hit.function, &module, &module_offset);
-		std::string caller_module;
-		uint64_t    caller_offset  = 0;
-		const bool  have_caller =
-		    linker->TryDescribeAddress(hit.return_address, &caller_module, &caller_offset);
-		std::printf("#%" PRIu64 " %s", hit.sequence,
-		            hit.name != nullptr ? hit.name->c_str() : "hook");
-		if (have_function) {
-			std::printf(" (%s+0x%" PRIx64 ")", module.c_str(), module_offset);
+	            total > retained ? ", older entries dropped" : "", shown);
+	for (uint64_t sequence = total - shown; sequence < total; sequence++) {
+		const auto& hit = g_guest_hook_ring[sequence % g_guest_hook_ring.size()];
+		if (hit.sequence != sequence) {
+			std::printf("#%" PRIu64 " (slot overwritten)\n", sequence);
+			continue;
 		}
-		std::printf(" ret ");
-		if (have_caller) {
-			std::printf("%s+0x%" PRIx64 "\n", caller_module.c_str(), caller_offset);
-		} else {
-			std::printf("0x%" PRIx64 "\n", hit.return_address);
-		}
-		std::printf("   rdi=%016" PRIx64 " rsi=%016" PRIx64 " rdx=%016" PRIx64
-		            " rcx=%016" PRIx64 " r8=%016" PRIx64 " r9=%016" PRIx64 "\n",
-		            hit.rdi, hit.rsi, hit.rdx, hit.rcx, hit.r8, hit.r9);
-		std::printf("   r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64
-		            " r15=%016" PRIx64 " rsp=%016" PRIx64 " [rsp+8]=%016" PRIx64 "\n",
-		            hit.r12, hit.r13, hit.r14, hit.r15, hit.rsp, hit.stack_argument);
-		std::printf("   stack args: %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64
-		            " %016" PRIx64 "\n",
-		            hit.stack_arguments[0], hit.stack_arguments[1], hit.stack_arguments[2],
-		            hit.stack_arguments[3], hit.stack_arguments[4]);
-		const auto print_dwords = [](const char* label, const uint8_t* data, int count) {
-			std::printf("   %s", label);
-			for (int i = 0; i < count; i++) {
-				uint32_t value = 0;
-				std::memcpy(&value, data + i * 4, sizeof(value));
-				std::printf("%s%08" PRIx32, (i % 8 == 0) ? "\n    " : " ", value);
-			}
-			std::printf("\n");
-		};
-		// The tiled-copy helper takes its increment vector as the seventh argument (ymm0 in the
-		// caller's frame) and the surface descriptor in rdx; both feed the address arithmetic
-		// that produced the bad offset.
-		print_dwords("ymm0 at entry:", hit.vectors.data() + 0 * 32, 8);
-		print_dwords("ymm4 at entry:", hit.vectors.data() + 4 * 32, 8);
-		if (IsReadableRange(hit.rdx, 0x80)) {
-			const auto label = fmt::format("descriptor rdx={:016x}:", hit.rdx);
-			print_dwords(label.c_str(), reinterpret_cast<const uint8_t*>(hit.rdx), 32);
-		} else {
-			std::printf("   descriptor rdx=%016" PRIx64 " (not mapped)\n", hit.rdx);
-		}
+		PrintOneGuestHookHit(hit);
+	}
+	g_guest_hook_lock.clear(std::memory_order_release);
+}
+
+// The fault report runs after the copy loop has already stored over the live descriptor, so the
+// newest hit recorded before the fault — the call that crashed — is the only place its input is
+// still intact.
+static void PrintFaultingGuestHookHit() {
+	const uint64_t total = g_guest_hook_total.load(std::memory_order_acquire);
+	if (total == 0) {
+		return;
+	}
+	std::printf("--- faulting guest hook call ---\n");
+	if (g_guest_hook_lock.test_and_set(std::memory_order_acquire)) {
+		std::printf("(ring busy)\n");
+		return;
+	}
+	const auto& hit = g_guest_hook_ring[(total - 1) % g_guest_hook_ring.size()];
+	if (hit.sequence == total - 1) {
+		PrintOneGuestHookHit(hit);
+	} else {
+		std::printf("#%" PRIu64 " (slot overwritten)\n", total - 1);
 	}
 	g_guest_hook_lock.clear(std::memory_order_release);
 }
@@ -1560,6 +1605,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 		}
+		PrintFaultingGuestHookHit();
 		PrintGuestHookHits();
 		std::fflush(stdout);
 		PrintRecentMemoryCalls(info->access_violation_vaddr, access_base);
