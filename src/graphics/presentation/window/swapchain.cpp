@@ -16,6 +16,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/flipDump.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
@@ -314,6 +315,8 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
+	// Debug: snapshots of the guest flip image at the present blit.
+	FlipDump                       m_flip_dump;
 };
 
 struct Presenter::Impl {
@@ -791,6 +794,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
+	// The previous dump's commands have run by now; write its PNG before recording new ones.
+	m_flip_dump.Finish(m_window.graphic_ctx);
 	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
 	const bool blit_source     = source != nullptr && !convert_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
@@ -802,6 +807,12 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	if (convert_source) {
 		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                vk::AccessFlagBits2::eShaderRead);
+		static std::atomic_bool flip_dump_hdr_note = false;
+		if (Config::DebugDumpFlipEnabled() && !flip_dump_hdr_note.exchange(true)) {
+			Log::WriteToConsoleAndLog(
+			    "flip dump: HDR presents convert the image through a shader; snapshots of them "
+			    "are not captured yet\n");
+		}
 	}
 	if (draw_overlay) {
 		overlay.frame->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -865,6 +876,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
+		m_flip_dump.Capture(vk_command, m_window.graphic_ctx, source->image.image,
+		                    source->image.extent);
 	}
 
 	vk::ImageMemoryBarrier to_present {};

@@ -96,6 +96,7 @@ struct ConfigOptions {
 	bool                   occlusion_queries_enabled   = false;
 	bool                   debug_depth_always          = false;
 	bool                   debug_sample_stats          = false;
+	bool                   debug_dump_flip             = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -170,6 +171,7 @@ bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool DebugDepthAlwaysEnabled();
 bool DebugSampleStatsEnabled();
+bool DebugDumpFlipEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

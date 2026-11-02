@@ -235,6 +235,7 @@ static constexpr Flag FLAGS[] = {
 #endif
     {"--debug-depth-always", &ConfigOptions::debug_depth_always},
     {"--debug-sample-stats", &ConfigOptions::debug_sample_stats},
+    {"--debug-dump-flip", &ConfigOptions::debug_dump_flip},
 };
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {

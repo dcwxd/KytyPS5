@@ -221,6 +221,10 @@ bool DebugSampleStatsEnabled() {
 	return g_config->debug_sample_stats;
 }
 
+bool DebugDumpFlipEnabled() {
+	return g_config->debug_dump_flip;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
