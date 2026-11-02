@@ -1205,15 +1205,25 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
-// Debug: what a scan-out writer reads. Once per pair, dumps the image bindings of the draw's
-// stages -- the guest range each texture was discovered from and the cache image that range
-// resolved to -- so a composite sampling an empty image at the scene address names itself.
-static void LogFlipWatchBindings(RenderContext&                             context,
-                                 std::span<PreparedBindings* const>         stages,
-                                 uint64_t                                   tag) {
-	static std::array<std::atomic_bool, FlipWatch::kPairSlots> logged {};
+// Debug: what a scan-out writer reads. Once per pair per window, dumps the image bindings of
+// the draw's stages -- the guest range each texture was discovered from and the cache image
+// that range resolved to -- so a composite sampling an empty image at the scene address names
+// itself.
+static const char* BindingTypeName(TextureCache::BindingType type) {
+	switch (type) {
+		case TextureCache::BindingType::Texture: return "texture";
+		case TextureCache::BindingType::Storage: return "storage";
+		case TextureCache::BindingType::RenderTarget: return "render-target";
+		case TextureCache::BindingType::DepthTarget: return "depth-target";
+		case TextureCache::BindingType::VideoOut: return "video-out";
+	}
+	return "?";
+}
+
+static void LogFlipWatchBindings(RenderContext&                     context,
+                                 std::span<PreparedBindings* const> stages, uint64_t tag) {
 	const auto slot = static_cast<uint32_t>(tag - 1);
-	if (slot >= FlipWatch::kPairSlots || logged[slot].exchange(true, std::memory_order_relaxed)) {
+	if (slot >= FlipWatch::kPairSlots || !context.GetFlipWatch().TakeBindLog(slot)) {
 		return;
 	}
 	auto& cache = context.GetTextureCache();
@@ -1230,13 +1240,18 @@ static void LogFlipWatchBindings(RenderContext&                             cont
 				continue;
 			}
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "flip-bind: pair slot={} desc addr=0x{:016x} size=0x{:x} fmt={} -> image "
-			    "addr=0x{:016x} serial=0x{:016x} fmt={} {}x{} gpu_modified={} video_out={}\n",
+			    "flip-bind: pair slot={} desc addr=0x{:016x} size=0x{:x} fmt={} type={} view "
+			    "mip={} levels={} layer={} layers={} -> image addr=0x{:016x} "
+			    "serial=0x{:016x} fmt={} {}x{} levels={} layers={} gpu_modified={} "
+			    "video_out={}\n",
 			    slot, image.desc.info.data.address, image.desc.info.data.size,
-			    vk::to_string(image.desc.info.pixel_format), resolved->info.data.address,
-			    resolved->serial, vk::to_string(resolved->info.pixel_format),
-			    resolved->info.extent.width, resolved->info.extent.height,
-			    resolved->IsGpuModified() ? "true" : "false",
+			    vk::to_string(image.desc.info.pixel_format),
+			    BindingTypeName(image.desc.type), image.desc.view_info.base_level,
+			    image.desc.view_info.level_count, image.desc.view_info.base_layer,
+			    image.desc.view_info.layer_count, resolved->info.data.address, resolved->serial,
+			    vk::to_string(resolved->info.pixel_format), resolved->info.extent.width,
+			    resolved->info.extent.height, resolved->info.resources.levels,
+			    resolved->info.resources.layers, resolved->IsGpuModified() ? "true" : "false",
 			    resolved->usage.video_out ? "true" : "false"));
 		}
 	}

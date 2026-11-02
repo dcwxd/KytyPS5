@@ -1082,6 +1082,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 				    pair.blend_dst, pair.blend_comb, pair.ps_shader_mask, pair.mode0,
 				    pair.export0, pair.pixel_kill ? "true" : "false", pair.ps_active));
 			});
+			// Binding dumps repeat once a window, so a log read at any point still names what
+			// each pair had been reading.
+			watch.ResetBindLogs();
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "flip watch: {} draws into scan-out this window, {} dropped no-vertex-stage "
 			    "targeting scan-out, {} skipped empty-fb targeting scan-out\n",

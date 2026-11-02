@@ -144,6 +144,18 @@ public:
 		return m_skip_logs.fetch_add(1, std::memory_order_relaxed) < 8;
 	}
 
+	// One bindings report per pair per window: the presenter's report resets the turns, and the
+	// pair's first draw of the new window logs again.
+	[[nodiscard]] bool TakeBindLog(uint32_t slot) {
+		return m_bind_logged[slot].exchange(0, std::memory_order_relaxed) != 0;
+	}
+
+	void ResetBindLogs() {
+		for (auto& turn: m_bind_logged) {
+			turn.store(1, std::memory_order_relaxed);
+		}
+	}
+
 	// Registers the draw under its shader pair and returns the pair's registry slot, or
 	// kNoMatch when the registry is full; the slot keys the pair's sample counts and the
 	// one-time dump of its bindings. A full registry is itself the report.
@@ -207,6 +219,7 @@ private:
 	std::array<std::atomic<uint64_t>, kSurfaceSlots> m_begins  {};
 	std::array<std::atomic<uint64_t>, kSurfaceSlots> m_ends    {};
 	std::array<Pair, kPairSlots>                     m_pairs   {};
+	std::array<std::atomic<uint32_t>, kPairSlots>    m_bind_logged {};
 	std::atomic<uint32_t>                            m_next_slot {0};
 	std::atomic<uint64_t>                            m_draws   {0};
 	std::atomic<uint64_t>                            m_drops   {0};
