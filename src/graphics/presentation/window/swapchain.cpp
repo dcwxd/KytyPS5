@@ -1035,11 +1035,12 @@ bool Presenter::Impl::CaptureRenderTargetDump(const RenderTargetPick::Pick& pick
 		}
 	}
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "{}: {} address=0x{:016x} format={} extent={}x{} samples={} mip={} layer={} "
+	    "{}: {} address=0x{:016x} format={} extent={}x{}x{} imgtype={} samples={} mip={} layer={} "
 	    "serial=0x{:016x}{}\n",
 	    input ? "rt input dump" : "rt dump",
 	    input ? "source" : "target", pick.address, vk::to_string(image->backing.format), width,
-	    height, image->info.samples, mip, layer, image->serial, extra));
+	    height, image->info.extent.depth, static_cast<uint32_t>(image->info.type),
+	    image->info.samples, mip, layer, image->serial, extra));
 	image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               range, command);
 	const bool captured =

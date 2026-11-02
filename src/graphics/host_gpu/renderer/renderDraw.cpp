@@ -1275,7 +1275,7 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "flip-bind: pair slot={} stage={} binding={} desc addr=0x{:016x} size=0x{:x} "
 			    "fmt={} type={} view mip={} levels={} layer={} layers={} -> image "
-			    "addr=0x{:016x} serial=0x{:016x} fmt={} {}x{} levels={} layers={} "
+			    "addr=0x{:016x} serial=0x{:016x} fmt={} {}x{}x{} imgtype={} levels={} layers={} "
 			    "gpu_modified={} imgdirty={} video_out={}\n",
 			    slot, stage_id, binding_index, image.desc.info.data.address,
 			    image.desc.info.data.size,
@@ -1284,7 +1284,8 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 			    image.desc.view_info.level_count, image.desc.view_info.base_layer,
 			    image.desc.view_info.layer_count, resolved->info.data.address, resolved->serial,
 			    vk::to_string(resolved->info.pixel_format), resolved->info.extent.width,
-			    resolved->info.extent.height, resolved->info.resources.levels,
+			    resolved->info.extent.height, resolved->info.extent.depth,
+			    static_cast<uint32_t>(resolved->info.type), resolved->info.resources.levels,
 			    resolved->info.resources.layers, resolved->IsGpuModified() ? "true" : "false",
 			    buffers_cache.HasGpuDirtyBytes(resolved->info.data.address,
 			                                   resolved->info.data.size) ? "true" : "false",
