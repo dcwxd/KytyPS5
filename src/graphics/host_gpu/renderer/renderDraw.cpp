@@ -1032,6 +1032,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			snapshot.mrt_mask       = ctx.GetRenderTargetMask();
 			snapshot.ps_shader_mask = state.ps_input_info.target_shader_mask;
 			snapshot.mode0          = state.ps_input_info.target_output_mode[0];
+			snapshot.prim_type      = static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType());
 			snapshot.export0        = color.export_mapping.packed;
 			snapshot.cc_mode        = ctx.GetColorControl().mode;
 			snapshot.blend_enable   = blend.enable;
@@ -1229,18 +1230,22 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 	auto&       cache   = context.GetTextureCache();
 	auto&       picks   = context.GetRenderTargetPick();
 	const auto* pair    = context.GetFlipWatch().PairForSlot(slot);
-	// The composite's shape: an unblended screen-covering quad. Its biggest read is the color
-	// source the flips should carry.
+	// The composite's shape: an unblended screen-covering quad. Its reads are the color inputs
+	// the flips should carry; the dumps rotate through them one per window.
 	const bool composite_shape =
 	    pair != nullptr && !pair->blend_enable && pair->first_index_count <= 6;
-	uint64_t best_pixels  = 0;
-	uint64_t best_serial  = 0;
-	uint64_t best_address = 0;
-	uint32_t best_index   = 0;
-	uint32_t best_width   = 0;
-	uint32_t best_height  = 0;
-	uint32_t best_mip     = 0;
-	uint32_t best_layer   = 0;
+	struct Input {
+		uint64_t serial;
+		uint64_t address;
+		uint32_t index;
+		uint32_t width;
+		uint32_t height;
+		uint32_t mip;
+		uint32_t layer;
+		uint64_t pixels;
+	};
+	std::array<Input, 8> inputs {};
+	uint32_t             input_count = 0;
 	for (const PreparedBindings* stage: stages) {
 		if (stage == nullptr) {
 			continue;
@@ -1253,19 +1258,13 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 			if (resolved == nullptr) {
 				continue;
 			}
-			if (composite_shape) {
-				const auto  ex      = image.desc.info.extent;
-				const auto  pixels = static_cast<uint64_t>(ex.width) * ex.height;
-				if (pixels > best_pixels) {
-					best_pixels  = pixels;
-					best_serial  = resolved->serial;
-					best_address = image.desc.info.data.address;
-					best_index   = image.image_id.index;
-					best_width   = ex.width;
-					best_height  = ex.height;
-					best_mip     = image.desc.view_info.base_level;
-					best_layer   = image.desc.view_info.base_layer;
-				}
+			if (composite_shape && input_count < inputs.size()) {
+				const auto ex = image.desc.info.extent;
+				inputs[input_count++] =
+				    Input {resolved->serial, image.desc.info.data.address, image.image_id.index,
+				           ex.width, ex.height, image.desc.view_info.base_level,
+				           image.desc.view_info.base_layer,
+				           static_cast<uint64_t>(ex.width) * ex.height};
 			}
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "flip-bind: pair slot={} desc addr=0x{:016x} size=0x{:x} fmt={} type={} view "
@@ -1283,9 +1282,17 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 			    resolved->usage.video_out ? "true" : "false"));
 		}
 	}
-	if (composite_shape && best_pixels != 0) {
-		picks.PublishInput(best_serial, best_address, best_index, best_width, best_height,
-		                   best_mip, best_layer);
+	if (composite_shape && input_count > 0) {
+		std::stable_sort(inputs.begin(), inputs.begin() + input_count,
+		                 [](const Input& left, const Input& right) {
+			                 return left.pixels > right.pixels;
+		                 });
+		picks.BeginInputList();
+		for (uint32_t index = 0; index < input_count; index++) {
+			picks.PublishInput(inputs[index].serial, inputs[index].address, inputs[index].index,
+			                   inputs[index].width, inputs[index].height, inputs[index].mip,
+			                   inputs[index].layer);
+		}
 	}
 }
 

@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <span>
@@ -94,29 +95,45 @@ public:
 		return pick;
 	}
 
-	// A second window, overlapping the first: the largest image an unblended screen-quad draw
-	// read -- the composite's color source, as opposed to the targets draws wrote. Last
-	// publisher wins; the pair registry publishes fresh every window.
+	// A second window, overlapping the first: the images an unblended screen-quad draw read --
+	// the composite's color inputs, as opposed to the targets draws wrote. The pair registry
+	// republishes the list every window; the dumps rotate one input per window, so even 1x1
+	// exposure textures eventually print their texel.
+	void BeginInputList() { m_input_count.store(0, std::memory_order_relaxed); }
+
 	void PublishInput(uint64_t serial, uint64_t address, uint32_t image_index, uint32_t width,
 	                  uint32_t height, uint32_t mip, uint32_t layer) {
 		if (serial == 0 || width == 0 || height == 0 || width > 0xffffu || height > 0xffffu ||
 		    mip > 0xffffu || layer > 0xffffu) {
 			return;
 		}
-		m_input_serial.store(serial, std::memory_order_relaxed);
-		m_input_address.store(address, std::memory_order_relaxed);
-		m_input_slot.store(image_index + 1u, std::memory_order_relaxed);
-		m_input_wh.store((width << 16u) | height, std::memory_order_relaxed);
-		m_input_ml.store((mip << 16u) | layer, std::memory_order_relaxed);
+		const auto index = m_input_count.fetch_add(1, std::memory_order_relaxed);
+		if (index >= kInputSlots) {
+			return;
+		}
+		m_input_serial[index].store(serial, std::memory_order_relaxed);
+		m_input_address[index].store(address, std::memory_order_relaxed);
+		m_input_slot[index].store(image_index + 1u, std::memory_order_relaxed);
+		m_input_wh[index].store((width << 16u) | height, std::memory_order_relaxed);
+		m_input_ml[index].store((mip << 16u) | layer, std::memory_order_relaxed);
 	}
 
 	[[nodiscard]] Pick TakeInput() {
 		Pick pick {};
-		const auto slot   = m_input_slot.exchange(0, std::memory_order_relaxed);
-		const auto wh     = m_input_wh.exchange(0, std::memory_order_relaxed);
-		pick.serial       = m_input_serial.exchange(0, std::memory_order_relaxed);
-		pick.address      = m_input_address.exchange(0, std::memory_order_relaxed);
-		const auto ml     = m_input_ml.exchange(0, std::memory_order_relaxed);
+		auto count = m_input_count.load(std::memory_order_relaxed);
+		if (count == 0) {
+			return pick;
+		}
+		if (count > kInputSlots) {
+			count = kInputSlots;
+		}
+		const auto cursor = m_input_cursor.fetch_add(1, std::memory_order_relaxed);
+		const auto index  = cursor % count;
+		const auto slot   = m_input_slot[index].load(std::memory_order_relaxed);
+		const auto wh     = m_input_wh[index].load(std::memory_order_relaxed);
+		const auto ml     = m_input_ml[index].load(std::memory_order_relaxed);
+		pick.serial       = m_input_serial[index].load(std::memory_order_relaxed);
+		pick.address      = m_input_address[index].load(std::memory_order_relaxed);
 		pick.image_index  = slot != 0 ? slot - 1u : pick.image_index;
 		pick.width        = wh >> 16u;
 		pick.height       = wh & 0xffffu;
@@ -127,17 +144,21 @@ public:
 	}
 
 private:
+	static constexpr uint32_t kInputSlots = 8;
+
 	std::atomic<uint64_t> m_best_pixels {0};
 	std::atomic<uint64_t> m_serial {0};
 	std::atomic<uint64_t> m_address {0};
 	std::atomic<uint32_t> m_image_slot {0};
 	std::atomic<uint32_t> m_packed_wh {0};
 	std::atomic<uint32_t> m_packed_ml {0};
-	std::atomic<uint64_t> m_input_serial {0};
-	std::atomic<uint64_t> m_input_address {0};
-	std::atomic<uint32_t> m_input_slot {0};
-	std::atomic<uint32_t> m_input_wh {0};
-	std::atomic<uint32_t> m_input_ml {0};
+	std::array<std::atomic<uint64_t>, kInputSlots> m_input_serial {};
+	std::array<std::atomic<uint64_t>, kInputSlots> m_input_address {};
+	std::array<std::atomic<uint32_t>, kInputSlots> m_input_slot {};
+	std::array<std::atomic<uint32_t>, kInputSlots> m_input_wh {};
+	std::array<std::atomic<uint32_t>, kInputSlots> m_input_ml {};
+	std::atomic<uint32_t> m_input_count {0};
+	std::atomic<uint32_t> m_input_cursor {0};
 };
 
 } // namespace Libs::Graphics

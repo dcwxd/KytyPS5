@@ -1079,14 +1079,15 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 				}
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "flip watch: pair slot={} vs=0x{:016x} ps=0x{:016x} draws={} {} indices={} "
-				    "instances={} addr=0x{:016x} {}x{} mrt={} cc_mode={} blend={} src={} dst={} "
-				    "comb={} ps_mask=0x{:x} mode0={} export0=0x{:02x} kill={} ps_active={}\n",
+				    "instances={} addr=0x{:016x} {}x{} mrt={} prim={} cc_mode={} blend={} src={} "
+				    "dst={} comb={} ps_mask=0x{:x} mode0={} export0=0x{:02x} kill={} "
+				    "ps_active={}\n",
 				    slot, pair.vertex_id, pair.pixel_id, pair.draws, pair.first_name,
 				    pair.first_index_count, pair.first_instance_count, pair.address,
 				    pair.packed_extent >> 16u, pair.packed_extent & 0xffffu, pair.mrt_mask,
-				    pair.cc_mode, pair.blend_enable ? "true" : "false", pair.blend_src,
-				    pair.blend_dst, pair.blend_comb, pair.ps_shader_mask, pair.mode0,
-				    pair.export0, pair.pixel_kill ? "true" : "false", pair.ps_active));
+				    pair.prim_type, pair.cc_mode, pair.blend_enable ? "true" : "false",
+				    pair.blend_src, pair.blend_dst, pair.blend_comb, pair.ps_shader_mask,
+				    pair.mode0, pair.export0, pair.pixel_kill ? "true" : "false", pair.ps_active));
 			});
 			// Binding dumps repeat once a window, so a log read at any point still names what
 			// each pair had been reading.
@@ -1097,13 +1098,13 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			    flip_draws, dropped, skipped));
 			auto&      registry = m_impl->renderer.GetRenderTargetPick();
 			const auto pick     = registry.Take();
-			const auto input    = registry.TakeInput();
 			bool       captured = false;
 			if (m_impl->dump_rt_turn) {
-				// Every other render-target turn dumps the composite's biggest read instead of
-				// the frame's biggest written target; together they say whether the color the
-				// composite sees was ever written.
+				// Every other render-target turn dumps one of the composite's reads instead of
+				// the frame's biggest written target, rotating through them window by window;
+				// together they say whether the color the composite sees was ever written.
 				if (m_impl->dump_input_turn) {
+					const auto input = registry.TakeInput();
 					if (input.valid) {
 						captured = m_impl->CaptureRenderTargetDump(input, buffer, true);
 					}

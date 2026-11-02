@@ -37,6 +37,7 @@ public:
 		uint32_t   mrt_mask             = 0;
 		uint32_t   ps_shader_mask       = 0;
 		uint32_t   mode0                = 0;
+		uint32_t   prim_type            = 0;
 		uint8_t    export0              = 0;
 		uint8_t    cc_mode              = 0;
 		bool       blend_enable         = false;
@@ -59,6 +60,7 @@ public:
 		uint32_t   mrt_mask             = 0;
 		uint32_t   ps_shader_mask       = 0;
 		uint32_t   mode0                = 0;
+		uint32_t   prim_type            = 0;
 		uint8_t    export0              = 0;
 		uint8_t    cc_mode              = 0;
 		bool       blend_enable         = false;
@@ -186,6 +188,7 @@ public:
 		    snapshot.mrt_mask,
 		    snapshot.ps_shader_mask,
 		    snapshot.mode0,
+		    snapshot.prim_type,
 		    snapshot.export0,
 		    snapshot.cc_mode,
 		    snapshot.blend_enable,
