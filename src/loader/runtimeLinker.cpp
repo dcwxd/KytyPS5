@@ -1391,6 +1391,16 @@ static void PrintOneGuestHookHit(const GuestHookHit& hit) {
 	print_dwords("ymm7 at entry (mask <<5, expect 0000030000000300):",
 	             hit.vectors.data() + 7 * 32, 8);
 	print_dwords("ymm8 at entry (mask <<4):", hit.vectors.data() + 8 * 32, 8);
+	if (hit.have_red_zone) {
+		// The unrolled body reads the bias from [rsp-0x48] and the swizzle mask from [rsp-0x28].
+		// Both are captured from the guest stack at the same point as the registers, so a snapshot
+		// that differs from what the loop must have read pins the clobber to the window between
+		// two hits instead of the whole call.
+		print_dwords("red zone [rsp-0x48] at entry:", hit.red_zone + (0x80 - 0x48), 4);
+		print_dwords("red zone [rsp-0x28] at entry:", hit.red_zone + (0x80 - 0x28), 4);
+	} else {
+		std::printf("   red zone at entry: not captured\n");
+	}
 	if (hit.have_descriptor) {
 		const auto label = fmt::format("descriptor at entry rdx={:016x}:", hit.rdx);
 		print_dwords(label.c_str(), reinterpret_cast<const uint8_t*>(hit.descriptor), 32);
