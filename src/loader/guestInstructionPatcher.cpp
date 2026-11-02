@@ -1657,6 +1657,7 @@ static_assert(offsetof(GuestFunctionHookRegisters, rsp) == HookFrameRsp);
 static_assert(offsetof(GuestFunctionHookRegisters, return_address) == HookFrameReturn);
 static_assert(offsetof(GuestFunctionHookRegisters, function_address) == HookFrameFunction);
 static_assert(offsetof(GuestFunctionHookRegisters, continuation) == HookFrameContinuation);
+static_assert(offsetof(GuestFunctionHookRegisters, vectors) == HookFrameVector);
 
 bool HookUsesAvx() {
 	static const bool avx = [] {
@@ -1667,6 +1668,10 @@ bool HookUsesAvx() {
 }
 
 } // namespace
+
+size_t GuestFunctionHookVectorStride() {
+	return HookUsesAvx() ? 32 : 16;
+}
 
 bool InstallGuestFunctionHook(uint64_t function_address, GuestFunctionHookCallback callback,
                               void* user_data) {

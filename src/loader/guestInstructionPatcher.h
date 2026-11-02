@@ -78,7 +78,16 @@ struct GuestFunctionHookRegisters {
 	uint64_t function_address;
 	// First instruction after the prologue the hook relocated out of the function entry.
 	uint64_t continuation;
+	// Padding up to the XMM/YMM save area the trampoline writes.
+	uint8_t reserved[0x60];
+	// XMM/YMM registers 0..15 as they were at the hook point. The layout depends on the host:
+	// AVX hosts store 32 bytes per register, hosts without AVX only the low 16 bytes. Use
+	// GuestFunctionHookVectorStride() when reading this area.
+	uint8_t vectors[16 * 32];
 };
+
+// 32 on AVX hosts, 16 when only the XMM half of every vector register is saved.
+size_t GuestFunctionHookVectorStride();
 
 // The callback runs on the guest stack with the guest register file saved around it: the
 // trampoline restores every GPR, the flags and the XMM/YMM registers after the callback returns.

@@ -32,9 +32,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
+#include <iterator>
 #include <magic_enum.hpp>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1067,42 +1072,104 @@ struct GuestHookSpec {
 	std::string name;
 };
 
+// The hook list can come from the environment or from a file next to the executable, because an
+// environment variable that a launcher sets does not always reach the emulator process. Blank
+// lines and lines starting with '#' are ignored; entries may be split by commas or newlines.
+static std::filesystem::path FindGuestHookFile() {
+	std::error_code               error;
+	const std::filesystem::path local {"guest_hooks.txt"};
+	if (std::filesystem::exists(local, error)) {
+		return local;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::array<wchar_t, 32768> name {};
+	const auto length = GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
+	if (length == 0 || length >= name.size()) {
+		return {};
+	}
+	const std::filesystem::path beside_exe =
+	    std::filesystem::path(name.data()).parent_path() / "guest_hooks.txt";
+	if (std::filesystem::exists(beside_exe, error)) {
+		return beside_exe;
+	}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	const std::filesystem::path beside_exe =
+	    std::filesystem::read_symlink("/proc/self/exe", error).parent_path() / "guest_hooks.txt";
+	if (!error && std::filesystem::exists(beside_exe, error)) {
+		return beside_exe;
+	}
+#endif
+	return {};
+}
+
+static void AppendGuestHookSpecs(std::string_view text, std::vector<GuestHookSpec>& result) {
+	while (!text.empty() && result.size() < 16) {
+		const auto  separator = text.find_first_of(",\r\n");
+		std::string item {text.substr(0, separator)};
+		text = separator == std::string_view::npos ? std::string_view {} : text.substr(separator + 1);
+
+		if (const auto comment = item.find('#'); comment != std::string::npos) {
+			item.erase(comment);
+		}
+		const auto first = item.find_first_not_of(" \t");
+		if (first == std::string::npos) {
+			continue;
+		}
+		item.erase(0, first);
+		item.erase(item.find_last_not_of(" \t") + 1);
+
+		GuestHookSpec spec;
+		const auto   equals = item.find('=');
+		std::string  number = item;
+		if (equals != std::string::npos) {
+			spec.name = item.substr(0, equals);
+			number    = item.substr(equals + 1);
+		}
+		char*                    end    = nullptr;
+		const unsigned long long offset = std::strtoull(number.c_str(), &end, 0);
+		if (end == number.c_str() || *end != '\0' || offset == 0) {
+			Log::WriteToConsoleAndLog(fmt::format("Guest hook: ignoring invalid entry '{}'\n", item));
+			continue;
+		}
+		spec.offset = offset;
+		if (spec.name.empty()) {
+			spec.name = fmt::format("+0x{:x}", offset);
+		}
+		result.push_back(std::move(spec));
+	}
+}
+
 static const std::vector<GuestHookSpec>& GetGuestHookSpecs() {
 	static const auto specs = [] {
 		std::vector<GuestHookSpec> result;
-		const char*                value = std::getenv("KYTY_GUEST_HOOKS");
-		if (value == nullptr) {
+		std::string                source;
+
+		if (const char* value = std::getenv("KYTY_GUEST_HOOKS");
+		    value != nullptr && *value != '\0') {
+			AppendGuestHookSpecs(value, result);
+			source = "KYTY_GUEST_HOOKS";
+		}
+		const auto file = FindGuestHookFile();
+		if (!file.empty()) {
+			std::ifstream     stream {file};
+			const std::string text {std::istreambuf_iterator<char>(stream),
+			                        std::istreambuf_iterator<char>()};
+			const auto before = result.size();
+			AppendGuestHookSpecs(text, result);
+			Log::WriteToConsoleAndLog(fmt::format("Guest hook file: {} ({} entries)\n",
+			                                      file.string(), result.size() - before));
+			source += source.empty() ? file.string() : " + " + file.string();
+		}
+		if (result.empty()) {
+			Log::WriteToConsoleAndLog("Guest hooks: disabled\n");
 			return result;
 		}
-		std::string text {value};
-		while (!text.empty() && result.size() < 16) {
-			const auto  comma = text.find(',');
-			std::string item  = text.substr(0, comma);
-			if (comma == std::string::npos) {
-				text.clear();
-			} else {
-				text.erase(0, comma + 1);
-			}
-			GuestHookSpec spec;
-			const auto    equals = item.find('=');
-			std::string   number = item;
-			if (equals != std::string::npos) {
-				spec.name = item.substr(0, equals);
-				number    = item.substr(equals + 1);
-			}
-			char*              end  = nullptr;
-			const unsigned long long offset = std::strtoull(number.c_str(), &end, 0);
-			if (end == number.c_str() || *end != '\0' || offset == 0) {
-				Log::WriteToConsoleAndLog(
-				    fmt::format("Guest hook: ignoring invalid entry '{}'\n", item));
-				continue;
-			}
-			spec.offset = offset;
-			if (spec.name.empty()) {
-				spec.name = fmt::format("+0x{:x}", offset);
-			}
-			result.push_back(std::move(spec));
+		std::string list;
+		for (const auto& spec: result) {
+			list += fmt::format(" {}@base+0x{:x}", spec.name, spec.offset);
 		}
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Guest hooks: {} configured from {}{}\n", result.size(), source, list));
 		return result;
 	}();
 	return specs;
@@ -1133,6 +1200,10 @@ struct GuestHookHit {
 	uint64_t    r15 = 0;
 	// First stack argument: at the entry of a SysV function it sits right above the return address.
 	uint64_t    stack_argument = 0;
+	// The five stack arguments: the return address is at [rsp], so arguments start at [rsp+8].
+	uint64_t    stack_arguments[5] {};
+	// XMM/YMM registers 0..15 at the hook point, 32 bytes each (low half zero when no AVX).
+	std::array<uint8_t, 16 * 32> vectors {};
 	const std::string* name = nullptr;
 };
 
@@ -1168,6 +1239,16 @@ static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registe
 	hit.r14              = registers->r14;
 	hit.r15              = registers->r15;
 	hit.stack_argument   = reinterpret_cast<const uint64_t*>(registers->rsp)[1];
+	const auto* stack = reinterpret_cast<const uint64_t*>(registers->rsp);
+	for (size_t i = 0; i < 5; i++) {
+		hit.stack_arguments[i] = stack[i + 1];
+	}
+	const size_t vector_stride = Loader::GuestFunctionHookVectorStride();
+	hit.vectors.fill(0);
+	for (size_t i = 0; i < 16; i++) {
+		std::memcpy(hit.vectors.data() + i * 32, registers->vectors + i * vector_stride,
+		            std::min<size_t>(vector_stride, 32));
+	}
 	hit.name             = static_cast<const std::string*>(user_data);
 	g_guest_hook_total.store(sequence + 1, std::memory_order_release);
 	g_guest_hook_lock.clear(std::memory_order_release);
@@ -1213,6 +1294,30 @@ static void PrintGuestHookHits() {
 		std::printf("   r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64
 		            " r15=%016" PRIx64 " rsp=%016" PRIx64 " [rsp+8]=%016" PRIx64 "\n",
 		            hit.r12, hit.r13, hit.r14, hit.r15, hit.rsp, hit.stack_argument);
+		std::printf("   stack args: %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+		            " %016" PRIx64 "\n",
+		            hit.stack_arguments[0], hit.stack_arguments[1], hit.stack_arguments[2],
+		            hit.stack_arguments[3], hit.stack_arguments[4]);
+		const auto print_dwords = [](const char* label, const uint8_t* data, int count) {
+			std::printf("   %s", label);
+			for (int i = 0; i < count; i++) {
+				uint32_t value = 0;
+				std::memcpy(&value, data + i * 4, sizeof(value));
+				std::printf("%s%08" PRIx32, (i % 8 == 0) ? "\n    " : " ", value);
+			}
+			std::printf("\n");
+		};
+		// The tiled-copy helper takes its increment vector as the seventh argument (ymm0 in the
+		// caller's frame) and the surface descriptor in rdx; both feed the address arithmetic
+		// that produced the bad offset.
+		print_dwords("ymm0 at entry:", hit.vectors.data() + 0 * 32, 8);
+		print_dwords("ymm4 at entry:", hit.vectors.data() + 4 * 32, 8);
+		if (IsReadableRange(hit.rdx, 0x80)) {
+			const auto label = fmt::format("descriptor rdx={:016x}:", hit.rdx);
+			print_dwords(label.c_str(), reinterpret_cast<const uint8_t*>(hit.rdx), 32);
+		} else {
+			std::printf("   descriptor rdx=%016" PRIx64 " (not mapped)\n", hit.rdx);
+		}
 	}
 	g_guest_hook_lock.clear(std::memory_order_release);
 }

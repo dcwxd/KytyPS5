@@ -4998,6 +4998,8 @@ struct GuestHookProbe {
 	uint64_t continuation       = 0;
 	bool     stack_has_return   = false;
 	bool     called_from_code   = false;
+	// Low lane of xmm0 at the hook point: proves the trampoline saved the vector file.
+	float    xmm0               = 0.0f;
 };
 
 void GuestHookClobberVectors() {
@@ -5023,6 +5025,7 @@ void GuestHookCallback(const Loader::GuestFunctionHookRegisters* registers, void
 	probe->continuation    = registers->continuation;
 	probe->stack_has_return =
 	    *reinterpret_cast<const uint64_t*>(registers->rsp) == registers->return_address;
+	std::memcpy(&probe->xmm0, registers->vectors, sizeof(probe->xmm0));
 	GuestHookClobberVectors();
 }
 
@@ -5087,6 +5090,8 @@ void TestGuestFunctionHook() {
 	Check(test, value == 0x1234 + 0x5678, "the hook lost the integer arguments");
 	Check(test, std::abs(result - 3.5f) < 0.0001f,
 	      "the hook lost the XMM argument across the host callback");
+	Check(test, std::abs(probe.xmm0 - 2.5f) < 0.0001f,
+	      "the hook frame does not expose the vector arguments");
 
 	function(1, 2, &result, 0.0f);
 	Check(test, probe.calls == 2 && result == 1.0f,
