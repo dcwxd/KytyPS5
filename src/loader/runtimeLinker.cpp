@@ -1231,6 +1231,11 @@ struct GuestHookHit {
 	// from the values the prologue writes.
 	uint8_t red_zone[0x80] {};
 	bool    have_red_zone = false;
+	// Bytes around the second swizzle-mask broadcast (function + 0x38), captured at entry. If the
+	// live code at the same address differs when the fault report runs, something rewrote guest
+	// code while the kernel was executing.
+	uint8_t code_probe[16] {};
+	bool    have_code_probe = false;
 	// XMM/YMM registers 0..15 at the hook point, 32 bytes each (low half zero when no AVX).
 	std::array<uint8_t, 16 * 32> vectors {};
 	const std::string* name = nullptr;
@@ -1285,6 +1290,14 @@ static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registe
 		                                                        sizeof(hit.red_zone)),
 		            sizeof(hit.red_zone));
 		hit.have_red_zone = true;
+	}
+	hit.have_code_probe = false;
+	if (registers->function_address != 0 &&
+	    IsReadableRange(registers->function_address + 0x38, sizeof(hit.code_probe))) {
+		std::memcpy(hit.code_probe,
+		            reinterpret_cast<const void*>(registers->function_address + 0x38),
+		            sizeof(hit.code_probe));
+		hit.have_code_probe = true;
 	}
 	const size_t vector_stride = Loader::GuestFunctionHookVectorStride();
 	hit.vectors.fill(0);
@@ -1349,6 +1362,13 @@ static void PrintOneGuestHookHit(const GuestHookHit& hit) {
 	             hit.vectors.data() + 13 * 32, 8);
 	print_dwords("ymm14 at entry:", hit.vectors.data() + 14 * 32, 8);
 	print_dwords("ymm15 at entry:", hit.vectors.data() + 15 * 32, 8);
+	// The kernel loads its swizzle masks into ymm6..ymm11 right after entry (the <<5 mask belongs in
+	// ymm7). They are caller-saved, so dumping them shows whether the caller left the values the
+	// kernel assumes, or whether a broadcast was rewritten to the wrong register.
+	print_dwords("ymm6 at entry (mask <<3):", hit.vectors.data() + 6 * 32, 8);
+	print_dwords("ymm7 at entry (mask <<5, expect 0000030000000300):",
+	             hit.vectors.data() + 7 * 32, 8);
+	print_dwords("ymm8 at entry (mask <<4):", hit.vectors.data() + 8 * 32, 8);
 	if (hit.have_descriptor) {
 		const auto label = fmt::format("descriptor at entry rdx={:016x}:", hit.rdx);
 		print_dwords(label.c_str(), reinterpret_cast<const uint8_t*>(hit.descriptor), 32);
@@ -1450,6 +1470,13 @@ static void PrintFaultingGuestHookHit(uint64_t fault_rsp) {
 			std::printf("\n");
 		};
 		if (hit.function != 0) {
+			if (hit.have_code_probe) {
+				std::printf("   code probe at entry %016" PRIx64 ":", hit.function + 0x38);
+				for (size_t i = 0; i < sizeof(hit.code_probe); i++) {
+					std::printf("%s%02x", (i % 16 == 0) ? "\n    " : " ", hit.code_probe[i]);
+				}
+				std::printf("\n");
+			}
 			dump_code("function head (patched)", hit.function, 0x40);
 			dump_code("function body", hit.function + 0x40, 0xe0);
 		}
