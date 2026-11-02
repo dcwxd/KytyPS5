@@ -1690,9 +1690,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				            static_cast<uint32_t>(info->rsi), info->r8);
 			}
 			// Red-zone protection rewrites every stack access while the descriptor spill is live as
-			// `lea rsp,[rsp-0x80]` + original operand, so the loop reads the slots 0x80 lower than
-			// the prologue would naturally place them. Printing both the natural and the relocated
-			// slots tells whether the store and the load were rewritten consistently.
+			// `lea rsp,[rsp-0x80]` + original operand, so a shifted access reads slots 0x80 lower
+			// than the prologue would naturally place them. Printing both the natural and the
+			// relocated slots tells whether the store and the load were rewritten consistently.
 			const auto dump_slot = [](const char* label, uint64_t address) {
 				std::printf("   %s %016" PRIx64 ":", label, address);
 				if (!IsReadableRange(address, 32)) {
@@ -1712,9 +1712,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			          rsp - 0x28);
 			dump_slot("red zone natural [rsp-0x48] (add operand, desc[0x20..0x40])",
 			          rsp - 0x48);
-			dump_slot("red zone relocated [rsp-0xd8] (what the load reads if shifted)",
+			// GuestRedZoneSize is 0x80, so a relocated slot sits exactly 0x80 below the natural
+			// one. These are the addresses a shifted `[rsp-0x28]` / `[rsp-0x48]` access uses.
+			dump_slot("red zone relocated [rsp-0xa8] (what the load reads if shifted)",
+			          rsp - 0xa8);
+			dump_slot("red zone relocated [rsp-0xc8] (what the load reads if shifted)",
+			          rsp - 0xc8);
+			// Keep the older 0xb0-offset probes visible until the shift is confirmed: they sit 0x30
+			// below the correct relocated slots, which is what earlier runs reported.
+			dump_slot("red zone probe [rsp-0xd8] (legacy 0xb0 offset)",
 			          rsp - 0xd8);
-			dump_slot("red zone relocated [rsp-0xf8] (what the load reads if shifted)",
+			dump_slot("red zone probe [rsp-0xf8] (legacy 0xb0 offset)",
 			          rsp - 0xf8);
 			// The callee's return address sits 0x30 above rsp, so the caller's frame (its spilled
 			// parameters, the function it dispatched through and the surface it passed) starts
