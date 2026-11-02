@@ -1646,8 +1646,14 @@ constexpr int HookFrameReturn     = 0x88;
 constexpr int HookFrameFunction   = 0x90;
 constexpr int HookFrameContinuation = 0x98;
 constexpr int HookFrameVector     = 0x100;
-// 16 vectors of 32 bytes, then padding so the frame keeps the guest stack 16-byte aligned.
-constexpr int HookFrameSize = HookFrameVector + 16 * 32 + 8;
+// The vector save area must end below the caller's 128-byte red zone: with a smaller frame the
+// upper halves of ymm12/ymm13 land exactly on the slots a guest prologue spills its descriptor
+// into, so the hook would overwrite the very data it is meant to observe. Keeping the saves below
+// [rsp-0x80, rsp) leaves the guest red zone untouched until the hooked function runs. The trailing
+// padding keeps the frame at 8 modulo 16, which is what the host call needs.
+constexpr int HookFrameRedZoneGuard = 0x80;
+constexpr int HookFrameSize =
+    HookFrameVector + 16 * 32 + HookFrameRedZoneGuard + 8;
 
 static_assert(HookFrameSize % 16 == 8, "the frame must leave rsp aligned for the host call");
 static_assert(offsetof(GuestFunctionHookRegisters, r15) == HookFrameR15);
