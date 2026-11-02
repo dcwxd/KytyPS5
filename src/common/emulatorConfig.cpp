@@ -217,6 +217,10 @@ bool DebugDepthAlwaysEnabled() {
 	return g_config->debug_depth_always;
 }
 
+bool DebugSampleStatsEnabled() {
+	return g_config->debug_sample_stats;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

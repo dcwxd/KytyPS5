@@ -902,6 +902,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
+	m_context.GetRasterSampleStats().Report();
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
@@ -1297,6 +1298,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	auto&         sample_stats      = m_context.GetRasterSampleStats();
+	const int32_t sample_query      = sample_stats.BeginWrap(vk_buffer);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -1311,6 +1314,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                       emit.indirect.count, emit.indirect.stride);
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
+	sample_stats.EndWrap(vk_buffer, sample_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

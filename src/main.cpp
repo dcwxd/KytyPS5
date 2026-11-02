@@ -234,6 +234,7 @@ static constexpr Flag FLAGS[] = {
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif
     {"--debug-depth-always", &ConfigOptions::debug_depth_always},
+    {"--debug-sample-stats", &ConfigOptions::debug_sample_stats},
 };
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
