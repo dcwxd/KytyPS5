@@ -18,10 +18,12 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/flipDump.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <fmt/ranges.h>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -1015,12 +1017,29 @@ bool Presenter::Impl::CaptureRenderTargetDump(const RenderTargetPick::Pick& pick
 	// subresource, so the tracked state stays consistent for whatever renders next.
 	const ImageSubresourceRange range {mip, 1, layer, 1};
 	auto        command   = buffer.Handle();
+	// Input captures double as texture forensics: report the tracked dirty state, and peek at
+	// the first bytes of guest backing for tiny sources, so a never-written image shows
+	// whether the game memory itself holds texel data our image never received.
+	std::string extra;
+	if (input) {
+		extra += fmt::format(" cpu_dirty={} buffer_modified={}", image->IsCpuDirty(),
+		                     image->IsBufferModified());
+	}
+	if (width <= 4 && height <= 4) {
+		std::array<uint8_t, 16> bytes {};
+		if (LibKernel::Memory::TryReadBacking(image->info.data.address, bytes.data(),
+		                                      bytes.size())) {
+			extra += fmt::format(" guest={:02x}", fmt::join(bytes, " "));
+		} else {
+			extra += " guest=<unreadable>";
+		}
+	}
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "{}: {} address=0x{:016x} format={} extent={}x{} samples={} mip={} layer={} "
-	    "serial=0x{:016x}\n",
+	    "serial=0x{:016x}{}\n",
 	    input ? "rt input dump" : "rt dump",
 	    input ? "source" : "target", pick.address, vk::to_string(image->backing.format), width,
-	    height, image->info.samples, mip, layer, image->serial));
+	    height, image->info.samples, mip, layer, image->serial, extra));
 	image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               range, command);
 	const bool captured =
