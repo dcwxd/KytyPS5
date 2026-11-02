@@ -1013,9 +1013,10 @@ bool Presenter::Impl::CaptureRenderTargetDump(const RenderTargetPick::Pick& pick
 	const ImageSubresourceRange range {mip, 1, layer, 1};
 	auto        command = buffer.Handle();
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "rt dump: target address=0x{:016x} format={} extent={}x{} samples={} mip={} layer={}\n",
+	    "rt dump: target address=0x{:016x} format={} extent={}x{} samples={} mip={} layer={} "
+	    "serial=0x{:016x}\n",
 	    pick.address, vk::to_string(image->backing.format), width, height, image->info.samples,
-	    mip, layer));
+	    mip, layer, image->serial));
 	image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               range, command);
 	const bool captured =
@@ -1066,15 +1067,15 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			const auto  flip_draws   = watch.TakeDrawCount();
 			const auto  dropped      = watch.TakeDropCount();
 			const auto  skipped      = watch.TakeSkipCount();
-			watch.ReportPairs([](const FlipWatch::Pair& pair) {
+			watch.ReportPairs([](uint32_t slot, const FlipWatch::Pair& pair) {
 				if (pair.draws == 0) {
 					return;
 				}
 				Log::WriteToConsoleAndLog(fmt::format(
-				    "flip watch: pair vs=0x{:016x} ps=0x{:016x} draws={} {} indices={} "
+				    "flip watch: pair slot={} vs=0x{:016x} ps=0x{:016x} draws={} {} indices={} "
 				    "instances={} addr=0x{:016x} {}x{} mrt={} cc_mode={} blend={} src={} dst={} "
 				    "comb={} ps_mask=0x{:x} mode0={} export0=0x{:02x} kill={} ps_active={}\n",
-				    pair.vertex_id, pair.pixel_id, pair.draws, pair.first_name,
+				    slot, pair.vertex_id, pair.pixel_id, pair.draws, pair.first_name,
 				    pair.first_index_count, pair.first_instance_count, pair.address,
 				    pair.packed_extent >> 16u, pair.packed_extent & 0xffffu, pair.mrt_mask,
 				    pair.cc_mode, pair.blend_enable ? "true" : "false", pair.blend_src,

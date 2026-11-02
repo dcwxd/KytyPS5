@@ -24,8 +24,9 @@ public:
 
 	[[nodiscard]] bool Enabled() const { return m_pool != nullptr; }
 
-	// One query per draw: negative when disabled or the ring is short of free queries.
-	[[nodiscard]] int32_t BeginWrap(vk::CommandBuffer command);
+	// One query per draw; the tag attributes scan-out writers to their flip-watch pair.
+	// Negative when disabled or the ring is short of free queries.
+	[[nodiscard]] int32_t BeginWrap(vk::CommandBuffer command, uint64_t tag = 0);
 	void EndWrap(vk::CommandBuffer command, int32_t query) const;
 
 	// Throttled, lock-avoiding readout after the GPU reaches the last recorded draw; missing this
@@ -46,6 +47,8 @@ private:
 	uint64_t              m_lively_draws {};
 	uint64_t              m_samples_total {};
 	std::vector<uint64_t> m_results;
+	// The flip-watch pair of each ring slot, zero for draws the pair registry does not know.
+	std::vector<uint64_t> m_tags;
 	std::atomic<uint64_t> m_last_report_ns {0};
 	std::atomic_flag      m_reporting = ATOMIC_FLAG_INIT;
 };

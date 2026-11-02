@@ -1041,7 +1041,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			snapshot.pixel_kill     = state.ps_input_info.ps_pixel_kill_enable;
 			snapshot.ps_active      = state.ps_active;
 			snapshot.name           = draw.Name();
-			watch.NoteDrawPair(vertex_id, pixel_id, snapshot);
+			const uint32_t pair_slot = watch.NoteDrawPair(vertex_id, pixel_id, snapshot);
+			state.flip_watch_tag     = pair_slot != FlipWatch::kNoMatch
+			                               ? static_cast<uint64_t>(pair_slot) + 1
+			                               : 0;
 		}
 		if (any) {
 			watch.CountDraw();
@@ -1202,6 +1205,43 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// Debug: what a scan-out writer reads. Once per pair, dumps the image bindings of the draw's
+// stages -- the guest range each texture was discovered from and the cache image that range
+// resolved to -- so a composite sampling an empty image at the scene address names itself.
+static void LogFlipWatchBindings(RenderContext&                             context,
+                                 std::span<PreparedBindings* const>         stages,
+                                 uint64_t                                   tag) {
+	static std::array<std::atomic_bool, FlipWatch::kPairSlots> logged {};
+	const auto slot = static_cast<uint32_t>(tag - 1);
+	if (slot >= FlipWatch::kPairSlots || logged[slot].exchange(true, std::memory_order_relaxed)) {
+		return;
+	}
+	auto& cache = context.GetTextureCache();
+	for (const PreparedBindings* stage: stages) {
+		if (stage == nullptr) {
+			continue;
+		}
+		for (const auto& image: stage->images) {
+			if (!image.image_id) {
+				continue;
+			}
+			const auto* resolved = cache.TryGetImage(image.image_id);
+			if (resolved == nullptr) {
+				continue;
+			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "flip-bind: pair slot={} desc addr=0x{:016x} size=0x{:x} fmt={} -> image "
+			    "addr=0x{:016x} serial=0x{:016x} fmt={} {}x{} gpu_modified={} video_out={}\n",
+			    slot, image.desc.info.data.address, image.desc.info.data.size,
+			    vk::to_string(image.desc.info.pixel_format), resolved->info.data.address,
+			    resolved->serial, vk::to_string(resolved->info.pixel_format),
+			    resolved->info.extent.width, resolved->info.extent.height,
+			    resolved->IsGpuModified() ? "true" : "false",
+			    resolved->usage.video_out ? "true" : "false"));
+		}
+	}
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          const DrawEmitInfo&          emit,
@@ -1270,6 +1310,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	if (Config::DebugDumpFlipEnabled() && state.flip_watch_tag != 0) {
+		LogFlipWatchBindings(m_context, stages, state.flip_watch_tag);
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1385,7 +1428,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	auto&         sample_stats      = m_context.GetRasterSampleStats();
-	const int32_t sample_query      = sample_stats.BeginWrap(vk_buffer);
+	const int32_t sample_query      = sample_stats.BeginWrap(vk_buffer, state.flip_watch_tag);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {

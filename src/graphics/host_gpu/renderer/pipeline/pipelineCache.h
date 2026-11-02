@@ -142,6 +142,9 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets                indirect_offsets;
 	bool                                 indirect_draw = false;
+	// Debug (--debug-dump-flip): the flip watch pair this draw belongs to, zero when none.
+	// Keys the pair's occlusion samples and the one-time dump of its image bindings.
+	uint64_t                             flip_watch_tag = 0;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};

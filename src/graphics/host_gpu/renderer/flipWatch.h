@@ -144,24 +144,24 @@ public:
 		return m_skip_logs.fetch_add(1, std::memory_order_relaxed) < 8;
 	}
 
-	// True the first time this shader pair writes a watched surface; the pair keeps the
-	// reporting details of that first draw. A full registry stays silent; that many distinct
-	// writers is itself the report.
-	bool NoteDrawPair(uint64_t vertex_id, uint64_t pixel_id, const DrawSnapshot& snapshot) {
+	// Registers the draw under its shader pair and returns the pair's registry slot, or
+	// kNoMatch when the registry is full; the slot keys the pair's sample counts and the
+	// one-time dump of its bindings. A full registry is itself the report.
+	uint32_t NoteDrawPair(uint64_t vertex_id, uint64_t pixel_id, const DrawSnapshot& snapshot) {
 		uint32_t free_slot = kNoMatch;
 		for (uint32_t index = 0; index < kPairSlots; index++) {
 			Pair& pair = m_pairs[index];
 			if (pair.seen) {
 				if (pair.vertex_id == vertex_id && pair.pixel_id == pixel_id) {
 					pair.draws++;
-					return false;
+					return index;
 				}
 			} else if (free_slot == kNoMatch) {
 				free_slot = index;
 			}
 		}
 		if (free_slot == kNoMatch) {
-			return false;
+			return kNoMatch;
 		}
 		m_pairs[free_slot] = Pair {
 		    vertex_id,
@@ -185,18 +185,19 @@ public:
 		    snapshot.name,
 		    true,
 		};
-		return true;
+		return free_slot;
 	}
 
-	// Reports every seen pair with the state of its first draw and the count since the last
-	// report, then clears those counts.
+	// Reports every seen pair with its registry slot, the state of its first draw and the count
+	// since the last report, then clears those counts.
 	template <typename Report>
 	void ReportPairs(Report&& report) {
-		for (auto& pair: m_pairs) {
+		for (uint32_t index = 0; index < kPairSlots; index++) {
+			Pair& pair = m_pairs[index];
 			if (!pair.seen) {
 				continue;
 			}
-			report(pair);
+			report(index, pair);
 			pair.draws = 0;
 		}
 	}
