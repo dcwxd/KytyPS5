@@ -1207,6 +1207,11 @@ struct GuestHookHit {
 	// fields that produced the bad offset.
 	uint32_t descriptor[32] {};
 	bool     have_descriptor = false;
+	// The 128-byte red zone below the entry rsp. The tiled copy spills the descriptor there and
+	// the unrolled loop reads it back, so capturing it at entry separates the caller's leftovers
+	// from the values the prologue writes.
+	uint8_t red_zone[0x80] {};
+	bool    have_red_zone = false;
 	// XMM/YMM registers 0..15 at the hook point, 32 bytes each (low half zero when no AVX).
 	std::array<uint8_t, 16 * 32> vectors {};
 	const std::string* name = nullptr;
@@ -1253,6 +1258,14 @@ static void RecordGuestHookHit(const Loader::GuestFunctionHookRegisters* registe
 		std::memcpy(hit.descriptor, reinterpret_cast<const void*>(registers->rdx),
 		            sizeof(hit.descriptor));
 		hit.have_descriptor = true;
+	}
+	hit.have_red_zone = false;
+	if (registers->rsp >= sizeof(hit.red_zone) &&
+	    IsReadableRange(registers->rsp - sizeof(hit.red_zone), sizeof(hit.red_zone))) {
+		std::memcpy(hit.red_zone, reinterpret_cast<const void*>(registers->rsp -
+		                                                        sizeof(hit.red_zone)),
+		            sizeof(hit.red_zone));
+		hit.have_red_zone = true;
 	}
 	const size_t vector_stride = Loader::GuestFunctionHookVectorStride();
 	hit.vectors.fill(0);
@@ -1308,6 +1321,15 @@ static void PrintOneGuestHookHit(const GuestHookHit& hit) {
 	print_dwords("ymm0 at entry:", hit.vectors.data() + 0 * 32, 8);
 	print_dwords("ymm1 (indices) at entry:", hit.vectors.data() + 1 * 32, 8);
 	print_dwords("ymm4 at entry:", hit.vectors.data() + 4 * 32, 8);
+	// The hook saves every YMM into its own frame, and the upper halves of ymm12/ymm13 land on
+	// the exact red-zone slots the tiled copy spills the descriptor into. If the preamble stores
+	// never overwrite them, the loop reads these leftovers instead of the descriptor fields.
+	print_dwords("ymm12 at entry (upper half hits [rsp-0x48]):",
+	             hit.vectors.data() + 12 * 32, 8);
+	print_dwords("ymm13 at entry (upper half hits [rsp-0x28]):",
+	             hit.vectors.data() + 13 * 32, 8);
+	print_dwords("ymm14 at entry:", hit.vectors.data() + 14 * 32, 8);
+	print_dwords("ymm15 at entry:", hit.vectors.data() + 15 * 32, 8);
 	if (hit.have_descriptor) {
 		const auto label = fmt::format("descriptor at entry rdx={:016x}:", hit.rdx);
 		print_dwords(label.c_str(), reinterpret_cast<const uint8_t*>(hit.descriptor), 32);
@@ -1348,7 +1370,7 @@ static void PrintGuestHookHits() {
 // The fault report runs after the copy loop has already stored over the live descriptor, so the
 // newest hit recorded before the fault — the call that crashed — is the only place its input is
 // still intact.
-static void PrintFaultingGuestHookHit() {
+static void PrintFaultingGuestHookHit(uint64_t fault_rsp) {
 	const uint64_t total = g_guest_hook_total.load(std::memory_order_acquire);
 	if (total == 0) {
 		return;
@@ -1360,6 +1382,12 @@ static void PrintFaultingGuestHookHit() {
 	}
 	const auto& hit = g_guest_hook_ring[(total - 1) % g_guest_hook_ring.size()];
 	if (hit.sequence == total - 1) {
+		// The six callee-saved pushes move rsp by 0x30; any other distance means the body that
+		// faulted did not run the prologue we decoded, which would leave the descriptor spill in
+		// different slots than the loop reads.
+		std::printf("   entry rsp=%016" PRIx64 " fault rsp=%016" PRIx64 " delta=0x%" PRIx64
+		            " (prologue pushes expect 0x30)\n",
+		            hit.rsp, fault_rsp, hit.rsp - fault_rsp);
 		PrintOneGuestHookHit(hit);
 		// The callee spills the descriptor fields it loaded and the caller parks the index vector
 		// on its own frame. Comparing those live copies with the entry snapshot says whether the
@@ -1380,6 +1408,32 @@ static void PrintFaultingGuestHookHit() {
 		};
 		dump_live("live descriptor", hit.rdx, 0x80);
 		dump_live("live index vector", hit.stack_arguments[0], 0x20);
+		// Snapshot of the red zone before the prologue runs. If the loop reads these words instead
+		// of the descriptor fields, the prologue spill never reached the slots the loop loads.
+		if (hit.have_red_zone) {
+			dump_live("red zone at entry [rsp-0x80..rsp]", hit.rsp - 0x80, 0x80);
+		} else {
+			std::printf("   red zone at entry (not readable)\n");
+		}
+		// The hook patches the function entry with a jump to its trampoline; dumping the bytes
+		// from guest memory (not from the file) shows the patch and whether the prologue that
+		// spills the descriptor into the red zone is still reached afterwards.
+		const auto dump_code = [](const char* label, uint64_t address, size_t size) {
+			std::printf("   %s %016" PRIx64 ":", label, address);
+			if (!IsReadableRange(address, size)) {
+				std::printf(" (not mapped)\n");
+				return;
+			}
+			const auto* bytes = reinterpret_cast<const uint8_t*>(address);
+			for (size_t i = 0; i < size; i++) {
+				std::printf("%s%02x", (i % 16 == 0) ? "\n    " : " ", bytes[i]);
+			}
+			std::printf("\n");
+		};
+		if (hit.function != 0) {
+			dump_code("function head (patched)", hit.function, 0x40);
+			dump_code("function body", hit.function + 0x40, 0xe0);
+		}
 	} else {
 		std::printf("#%" PRIu64 " (slot overwritten)\n", total - 1);
 	}
@@ -1574,17 +1628,61 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// descriptor's base vector at [rsp-0x48] and the caller's swizzle mask at [rsp-0x28].
 		// Dumping below rsp shows the vector that produced the huge destination offsets.
 		{
-			constexpr int kStackBefore = 10;
+			// The loop counter lives behind r9 and the per-iteration index step in r8; together
+			// they say which lane range the unrolled stores were about to cover.
+			// r9 points at the initial index, esi holds the current one and r8 is the step the
+			// unrolled body adds per iteration.
+			if (info->r9 != 0 && IsReadableRange(info->r9, sizeof(uint32_t))) {
+				uint32_t initial = 0;
+				std::memcpy(&initial, reinterpret_cast<const void*>(info->r9), sizeof(initial));
+				std::printf("index initial [r9]=%08" PRIx32 " current rsi=%08" PRIx32
+				            " step r8=%016" PRIx64 "\n",
+				            initial, static_cast<uint32_t>(info->rsi), info->r8);
+			} else {
+				std::printf("index initial [r9] (not mapped) current rsi=%08" PRIx32
+				            " step r8=%016" PRIx64 "\n",
+				            static_cast<uint32_t>(info->rsi), info->r8);
+			}
+			// Red-zone protection rewrites every stack access while the descriptor spill is live as
+			// `lea rsp,[rsp-0x80]` + original operand, so the loop reads the slots 0x80 lower than
+			// the prologue would naturally place them. Printing both the natural and the relocated
+			// slots tells whether the store and the load were rewritten consistently.
+			const auto dump_slot = [](const char* label, uint64_t address) {
+				std::printf("   %s %016" PRIx64 ":", label, address);
+				if (!IsReadableRange(address, 32)) {
+					std::printf(" (not mapped)\n");
+					return;
+				}
+				const auto* data = reinterpret_cast<const uint8_t*>(address);
+				for (int i = 0; i < 8; i++) {
+					uint32_t value = 0;
+					std::memcpy(&value, data + i * 4, sizeof(value));
+					std::printf("%s%08" PRIx32, (i % 8 == 0) ? "\n    " : " ", value);
+				}
+				std::printf("\n");
+			};
+			const uint64_t rsp = info->rsp;
+			dump_slot("red zone natural [rsp-0x28] (xor operand, desc[0x00..0x20])",
+			          rsp - 0x28);
+			dump_slot("red zone natural [rsp-0x48] (add operand, desc[0x20..0x40])",
+			          rsp - 0x48);
+			dump_slot("red zone relocated [rsp-0xd8] (what the load reads if shifted)",
+			          rsp - 0xd8);
+			dump_slot("red zone relocated [rsp-0xf8] (what the load reads if shifted)",
+			          rsp - 0xf8);
 			// The callee's return address sits 0x30 above rsp, so the caller's frame (its spilled
 			// parameters, the function it dispatched through and the surface it passed) starts
-			// there. Reaching only 0x100 words past rsp showed none of it.
-			constexpr int kStackAfter = 72;
-			const int     total = kStackBefore + kStackAfter;
-			if (IsReadableRange(info->rsp - kStackBefore * 8, total * 8)) {
-				const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			// there. Reaching only 0x100 words past rsp showed none of it. Reaching 0x120 below
+			// rsp covers both relocated slots and the hook's YMM save area.
+			constexpr int kStackBefore = 36;
+			constexpr int kStackAfter  = 72;
+			const int     total        = kStackBefore + kStackAfter;
+			if (IsReadableRange(rsp - kStackBefore * 8, total * 8)) {
+				const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
 				std::printf("stack (rsp%+d .. rsp+%d):", -kStackBefore * 8, (kStackAfter - 1) * 8);
 				for (int i = -kStackBefore; i < kStackAfter; i++) {
-					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+					std::printf("%s rsp%+5d: %016" PRIx64, (i % 2 == 0) ? "\n " : "", i * 8,
+					            stack[i]);
 				}
 				std::printf("\n");
 				// Guest code addresses in the dumped words are likely return addresses.
@@ -1624,7 +1722,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 		}
-		PrintFaultingGuestHookHit();
+		PrintFaultingGuestHookHit(info->rsp);
 		PrintGuestHookHits();
 		std::fflush(stdout);
 		PrintRecentMemoryCalls(info->access_violation_vaddr, access_base);
