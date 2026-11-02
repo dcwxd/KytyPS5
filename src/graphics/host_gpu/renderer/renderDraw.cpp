@@ -898,6 +898,33 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// Debug: a composite that dies in the drop or skip paths never resolves its targets, so the
+// flip watch matches those draws' raw render-target addresses against the registered scan-out
+// ranges instead of resolved identities.
+static void NoteScanOutSkip(FlipWatch& watch, const CommandBuffer& buffer,
+                            const DrawCallInfo& draw, bool dropped) {
+	const auto& ctx = buffer.GetRegisters();
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto address = ctx.GetRenderTarget(slot).base.addr;
+		if (address == 0 || watch.MatchAddress(address) == FlipWatch::kNoMatch) {
+			continue;
+		}
+		if (dropped) {
+			watch.CountDrop();
+		} else {
+			watch.CountSkip();
+		}
+		if (watch.AllowSkipLog()) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "flip-skip: {} draw targeted scan-out address=0x{:016x} slot={} indices={} "
+			    "instances={}\n",
+			    dropped ? "dropped no-vertex-stage" : "skipped empty-fb", address, slot,
+			    draw.index_count, draw.instance_count));
+		}
+		return;
+	}
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -911,6 +938,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		CountDrawStats(true, false);
+		if (Config::DebugDumpFlipEnabled()) {
+			NoteScanOutSkip(m_context.GetFlipWatch(), buffer, draw, true);
+		}
 		return false;
 	}
 	if (draw.IsIndexed()) {
@@ -957,6 +987,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
 		CountDrawStats(false, true);
+		if (Config::DebugDumpFlipEnabled()) {
+			NoteScanOutSkip(m_context.GetFlipWatch(), buffer, draw, false);
+		}
 		return false;
 	}
 
@@ -969,8 +1002,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		                                        cache);
 		// And the flip watch asks whether this draw writes one of the game's scan-out
 		// surfaces, the ones flips present.
-		auto&    watch = m_context.GetFlipWatch();
-		bool     any   = false;
+		auto& watch  = m_context.GetFlipWatch();
+		auto& ctx    = buffer.GetRegisters();
+		bool  any    = false;
 		for (uint32_t slot = 0; slot < state.color_count; slot++) {
 			const auto& color = state.color_info[slot];
 			const auto* image = cache.TryGetImage(color.image_id);
@@ -978,20 +1012,31 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				continue;
 			}
 			any = true;
-			const auto  vertex_id =
-			    state.vertex_info[0].stage.module != nullptr
-			        ? state.vertex_info[0].stage.module->id
-			        : 0;
-			const auto  pixel_id = state.ps_input_info.stage.module != nullptr
+			const auto vertex_id = state.vertex_info[0].stage.module != nullptr
+			                           ? state.vertex_info[0].stage.module->id
+			                           : 0;
+			const auto pixel_id  = state.ps_input_info.stage.module != nullptr
 			                           ? state.ps_input_info.stage.module->id
 			                           : 0;
-			if (watch.NoteDrawPair(vertex_id, pixel_id)) {
-				const auto extent = color.Extent();
+			if (watch.NoteDrawPair(vertex_id, pixel_id, draw.index_count, draw.instance_count,
+			                       draw.Name())) {
+				// Blend, export and pixel-kill state decide whether a composite that reaches
+				// the surface also leaves something in it.
+				const auto&              cc        = ctx.GetColorControl();
+				const auto&              blend     = ctx.GetBlendControl(color.target_slot);
+				const auto               extent    = color.Extent();
+				const uint32_t           mask      = ctx.GetRenderTargetMask();
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "flip-draw: {} writes scan-out address=0x{:016x} slot={} extent={}x{} "
-				    "indices={} instances={} vs=0x{:016x} ps=0x{:016x}\n",
+				    "indices={} instances={} vs=0x{:016x} ps=0x{:016x} mrt={} cc_mode={} "
+				    "blend={} src={} dst={} comb={} ps_mask=0x{:x} mode0={} export0=0x{:02x} "
+				    "kill={} ps_active={}\n",
 				    draw.Name(), color.desc.info.data.address, slot, extent.width, extent.height,
-				    draw.index_count, draw.instance_count, vertex_id, pixel_id));
+				    draw.index_count, draw.instance_count, vertex_id, pixel_id, mask, cc.mode,
+				    blend.enable ? "true" : "false", blend.color_srcblend, blend.color_destblend,
+				    blend.color_comb_fcn, state.ps_input_info.target_shader_mask,
+				    state.ps_input_info.target_output_mode[0], color.export_mapping.packed,
+				    state.ps_input_info.ps_pixel_kill_enable ? "true" : "false", state.ps_active));
 			}
 		}
 		if (any) {

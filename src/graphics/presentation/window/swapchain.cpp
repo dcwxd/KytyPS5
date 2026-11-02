@@ -1044,7 +1044,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 	if (Config::DebugDumpFlipEnabled() &&
-	    m_impl->renderer.GetFlipWatch().Watch(image.serial)) {
+	    m_impl->renderer.GetFlipWatch().Watch(image.serial, image.info.data.address,
+	                                         image.info.data.size)) {
 		Log::WriteToConsoleAndLog(
 		    fmt::format("flip watch: scan-out surface address=0x{:016x} serial=0x{:016x}\n",
 		                image.info.data.address, image.serial));
@@ -1059,18 +1060,26 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		m_impl->flip_dump.Finish(m_impl->window.graphic_ctx);
 		if (m_impl->flip_dump.CaptureDue()) {
 			// The watch's report rides the same cadence: draws counted and per-shader-pair
-			// totals since the previous window.
-			auto& watch = m_impl->renderer.GetFlipWatch();
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "flip watch: {} draws into scan-out surfaces this window\n", watch.TakeDrawCount()));
-			watch.ReportPairs([](uint64_t vertex_id, uint64_t pixel_id, uint32_t draws) {
+			// totals since the previous window, plus the draws that died in the drop and skip
+			// paths pointing at these surfaces.
+			auto&       watch        = m_impl->renderer.GetFlipWatch();
+			const auto  flip_draws   = watch.TakeDrawCount();
+			const auto  dropped      = watch.TakeDropCount();
+			const auto  skipped      = watch.TakeSkipCount();
+			watch.ReportPairs([](uint64_t vertex_id, uint64_t pixel_id, uint32_t draws,
+			                     uint32_t indices, uint32_t instances, const char* name) {
 				if (draws == 0) {
 					return;
 				}
 				Log::WriteToConsoleAndLog(fmt::format(
-				    "flip watch: pair vs=0x{:016x} ps=0x{:016x} draws={}\n", vertex_id, pixel_id,
-				    draws));
+				    "flip watch: pair vs=0x{:016x} ps=0x{:016x} draws={} {} indices={} "
+				    "instances={}\n",
+				    vertex_id, pixel_id, draws, name, indices, instances));
 			});
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "flip watch: {} draws into scan-out this window, {} dropped no-vertex-stage "
+			    "targeting scan-out, {} skipped empty-fb targeting scan-out\n",
+			    flip_draws, dropped, skipped));
 			const auto pick     = m_impl->renderer.GetRenderTargetPick().Take();
 			bool       captured = false;
 			if (m_impl->dump_rt_turn && pick.valid) {

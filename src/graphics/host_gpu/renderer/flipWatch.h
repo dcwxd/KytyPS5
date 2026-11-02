@@ -11,11 +11,13 @@ namespace Libs::Graphics {
 // Debug-only companion of --debug-dump-flip: which draws and copies write the game's scan-out
 // surfaces, the ones flips present. The presenter registers each surface a flip is prepared
 // from; surviving draws that write one report their shader pair once, with the first draw's
-// details, and per-pair counts accumulate until the next report. A composite should appear as
-// a pair of its own (draws with screen-covering index counts); its absence among the pairs
-// while the world keeps rendering means the composite never even targets the surface.
-// Everything runs on the renderer thread under its mutex; the atomics only keep the draw-side
-// calls free of locks.
+// details, and per-pair counts accumulate until the next report. Draws that never ran because
+// their vertex stage is missing or their framebuffer resolved empty count against the very
+// same surfaces by raw render-target address, which catches a composite dying in the drop and
+// skip paths before any target resolves. A composite should appear as a pair of its own (draws
+// with screen-covering index counts); its absence while the world keeps rendering means it
+// never even targets the surface. Everything runs on the renderer thread under its mutex; the
+// atomics only keep the draw-side calls free of locks.
 class FlipWatch {
 public:
 	static constexpr uint32_t kSurfaceSlots = 4;
@@ -23,15 +25,18 @@ public:
 	static constexpr uint32_t kNoMatch      = 0xffffffffu;
 
 	struct Pair {
-		uint64_t vertex_id = 0;
-		uint64_t pixel_id  = 0;
-		uint32_t draws     = 0;
-		bool     seen      = false;
+		uint64_t   vertex_id            = 0;
+		uint64_t   pixel_id             = 0;
+		uint32_t   draws                = 0;
+		uint32_t   first_index_count    = 0;
+		uint32_t   first_instance_count = 0;
+		const char* first_name          = "";
+		bool       seen                 = false;
 	};
 
 	// True when this serial was not watched before. Surfaces cycle with the game's buffering;
 	// four live slots cover double and triple buffering.
-	bool Watch(uint64_t serial) {
+	bool Watch(uint64_t serial, uint64_t address, uint64_t size) {
 		uint32_t free_slot = kNoMatch;
 		for (uint32_t index = 0; index < kSurfaceSlots; index++) {
 			const auto known = m_serials[index].load(std::memory_order_relaxed);
@@ -46,6 +51,8 @@ public:
 			free_slot = m_next_slot.fetch_add(1, std::memory_order_relaxed) % kSurfaceSlots;
 		}
 		m_serials[free_slot].store(serial, std::memory_order_relaxed);
+		m_begins[free_slot].store(address, std::memory_order_relaxed);
+		m_ends[free_slot].store(address + size, std::memory_order_relaxed);
 		return true;
 	}
 
@@ -61,15 +68,51 @@ public:
 		return kNoMatch;
 	}
 
+	// Raw guest render-target addresses name skip candidates whose targets never resolved, so
+	// they match by containment in a watched surface's range rather than by identity.
+	[[nodiscard]] uint32_t MatchAddress(uint64_t address) const {
+		if (address == 0) {
+			return kNoMatch;
+		}
+		for (uint32_t index = 0; index < kSurfaceSlots; index++) {
+			const auto begin = m_begins[index].load(std::memory_order_relaxed);
+			if (begin != 0 && address >= begin &&
+			    address < m_ends[index].load(std::memory_order_relaxed)) {
+				return index;
+			}
+		}
+		return kNoMatch;
+	}
+
 	void CountDraw() { m_draws.fetch_add(1, std::memory_order_relaxed); }
+
+	void CountDrop() { m_drops.fetch_add(1, std::memory_order_relaxed); }
+
+	void CountSkip() { m_skips.fetch_add(1, std::memory_order_relaxed); }
 
 	[[nodiscard]] uint64_t TakeDrawCount() {
 		return m_draws.exchange(0, std::memory_order_relaxed);
 	}
 
-	// True the first time this shader pair writes a watched surface. A full registry stays
-	// silent; that many distinct writers is itself the report.
-	bool NoteDrawPair(uint64_t vertex_id, uint64_t pixel_id) {
+	[[nodiscard]] uint64_t TakeDropCount() {
+		return m_drops.exchange(0, std::memory_order_relaxed);
+	}
+
+	[[nodiscard]] uint64_t TakeSkipCount() {
+		return m_skips.exchange(0, std::memory_order_relaxed);
+	}
+
+	// A small global budget for skip lines: a handful of examples documents the pattern, more
+	// would only repeat it.
+	[[nodiscard]] bool AllowSkipLog() {
+		return m_skip_logs.fetch_add(1, std::memory_order_relaxed) < 8;
+	}
+
+	// True the first time this shader pair writes a watched surface; the pair keeps the
+	// reporting details of that first draw. A full registry stays silent; that many distinct
+	// writers is itself the report.
+	bool NoteDrawPair(uint64_t vertex_id, uint64_t pixel_id, uint32_t index_count,
+	                  uint32_t instance_count, const char* name) {
 		uint32_t free_slot = kNoMatch;
 		for (uint32_t index = 0; index < kPairSlots; index++) {
 			Pair& pair = m_pairs[index];
@@ -85,7 +128,8 @@ public:
 		if (free_slot == kNoMatch) {
 			return false;
 		}
-		m_pairs[free_slot] = Pair {vertex_id, pixel_id, 1, true};
+		m_pairs[free_slot] =
+		    Pair {vertex_id, pixel_id, 1, index_count, instance_count, name, true};
 		return true;
 	}
 
@@ -96,16 +140,22 @@ public:
 			if (!pair.seen) {
 				continue;
 			}
-			report(pair.vertex_id, pair.pixel_id, pair.draws);
+			report(pair.vertex_id, pair.pixel_id, pair.draws, pair.first_index_count,
+			       pair.first_instance_count, pair.first_name);
 			pair.draws = 0;
 		}
 	}
 
 private:
 	std::array<std::atomic<uint64_t>, kSurfaceSlots> m_serials {};
-	std::array<Pair, kPairSlots>                     m_pairs {};
+	std::array<std::atomic<uint64_t>, kSurfaceSlots> m_begins  {};
+	std::array<std::atomic<uint64_t>, kSurfaceSlots> m_ends    {};
+	std::array<Pair, kPairSlots>                     m_pairs   {};
 	std::atomic<uint32_t>                            m_next_slot {0};
-	std::atomic<uint64_t>                            m_draws {0};
+	std::atomic<uint64_t>                            m_draws   {0};
+	std::atomic<uint64_t>                            m_drops   {0};
+	std::atomic<uint64_t>                            m_skips   {0};
+	std::atomic<uint32_t>                            m_skip_logs {0};
 };
 
 } // namespace Libs::Graphics
