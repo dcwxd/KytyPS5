@@ -8,7 +8,9 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
-// stb_image_write's implementation lives in libPngEnc.cpp.
+// A private static copy of the writer: test targets link the presentation sources without
+// src/libs, where libPngEnc.cpp's shared implementation does not exist.
+#define STB_IMAGE_WRITE_STATIC
 #include "stb_image_write.h"
 
 #include <chrono>
