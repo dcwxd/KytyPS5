@@ -110,6 +110,32 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
         Log::WriteToConsoleAndLog(message);
 }
 
+// Mesh draws the host cannot run (no VK_EXT_mesh_shader, or beyond its limits) are dropped
+// silently after the first warning, which hides how widespread the loss is. Report every distinct
+// dropped shader once instead: bounded, lock-free, no locks on the draw path.
+constexpr size_t kDroppedMeshShaderReportMax = 16;
+
+std::array<std::atomic<uint64_t>, kDroppedMeshShaderReportMax> g_dropped_mesh_shaders {};
+
+void ReportDroppedMeshShader(uint64_t hash) {
+        if (hash == 0) {
+                return;
+        }
+        for (auto& slot: g_dropped_mesh_shaders) {
+                auto known = slot.load(std::memory_order_relaxed);
+                if (known == hash) {
+                        return;
+                }
+                if (known == 0 &&
+                    slot.compare_exchange_strong(known, hash, std::memory_order_relaxed)) {
+                        PipelineCacheLog(
+                            "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).",
+                            hash);
+                        return;
+                }
+        }
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
         // Scalar and unformatted buffer dependencies use the same backing as native raw loads.
         // Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -721,12 +747,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
                     mesh.max_vertices > limits.maxMeshOutputVertices ||
                     mesh.max_primitives > limits.maxMeshOutputPrimitives ||
                     mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-                        static std::atomic_bool warned = false;
-                        if (!warned.exchange(true, std::memory_order_relaxed)) {
-                                Log::WriteToConsoleAndLog(fmt::format(
-                                    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
-                                    vertex_params[0].hash));
-                        }
+                        ReportDroppedMeshShader(vertex_params[0].hash);
                         return;
                 }
                 // A task shader launches each record's groups and passes its draw parameters in a

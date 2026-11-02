@@ -84,6 +84,41 @@ static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
 
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
 
+// Per-draw accounting for the periodic banner. Counter::Draws only counts submitted work and only
+// while the debug panel is visible; these always count, so an ordinary log can tell how much of
+// the scene never reaches the host GPU (mesh draws dropped for the lack of VK_EXT_mesh_shader end
+// here as PrepareDrawRenderState() skips with a null vertex stage).
+static std::atomic<uint64_t> g_draws_seen         = 0;
+static std::atomic<uint64_t> g_draws_no_vertex    = 0;
+static std::atomic<uint64_t> g_draws_empty_fb     = 0;
+static std::atomic<uint64_t> g_draw_stats_last_ns = 0;
+
+static void CountDrawStats(bool no_vertex_stage, bool empty_framebuffer) {
+	g_draws_seen.fetch_add(1, std::memory_order_relaxed);
+	if (no_vertex_stage) {
+		g_draws_no_vertex.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (empty_framebuffer) {
+		g_draws_empty_fb.fetch_add(1, std::memory_order_relaxed);
+	}
+	// Throttled and lock-free: whoever wins the exchange prints, the other threads just add.
+	const auto       now     = std::chrono::steady_clock::now().time_since_epoch().count();
+	constexpr int64_t period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                  std::chrono::seconds(2))
+	                                  .count();
+	auto last = g_draw_stats_last_ns.load(std::memory_order_relaxed);
+	if (now - last < period ||
+	    !g_draw_stats_last_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "draw stats: total={} skipped no-vertex-stage(mesh or unsupported)={} skipped "
+	    "empty-fb={}\n",
+	    g_draws_seen.load(std::memory_order_relaxed),
+	    g_draws_no_vertex.load(std::memory_order_relaxed),
+	    g_draws_empty_fb.load(std::memory_order_relaxed)));
+}
+
 static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::PolyOffset& offset,
                                                 vk::Format host_depth_format) {
 	if (offset.db_is_float_fmt) {
@@ -874,6 +909,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
+		CountDrawStats(true, false);
 		return false;
 	}
 	if (draw.IsIndexed()) {
@@ -919,9 +955,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		CountDrawStats(false, true);
 		return false;
 	}
 
+	CountDrawStats(false, false);
 	return true;
 }
 
