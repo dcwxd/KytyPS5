@@ -1840,6 +1840,23 @@ bool InstallGuestFunctionHook(uint64_t function_address, GuestFunctionHookCallba
 	const uint64_t trampoline_address =
 	    reinterpret_cast<uint64_t>(trampoline.getCode()) + trampoline_begin;
 
+	// The emitted bytes are the ground truth for the save area layout: a frame that reaches into
+	// the guest red zone shows up here as a vector store with the wrong displacement, which the
+	// generated code alone can reveal (the generator's intent does not prove the encoding).
+	{
+		const auto*   code = reinterpret_cast<const uint8_t*>(trampoline_address);
+		const size_t  size = trampoline.getSize() - trampoline_begin;
+		std::printf("--- guest hook trampoline at %p (%zu bytes) ---\n",
+		            reinterpret_cast<const void*>(trampoline_address), size);
+		for (size_t offset = 0; offset < size; offset += 16) {
+			std::printf("  +%04zx:", offset);
+			for (size_t index = 0; index < 16 && offset + index < size; index++) {
+				std::printf(" %02x", code[offset + index]);
+			}
+			std::printf("\n");
+		}
+	}
+
 	auto& patch_gen = module->patch_gen;
 	patch_gen.reset();
 	patch_gen.setSize(function_address - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
