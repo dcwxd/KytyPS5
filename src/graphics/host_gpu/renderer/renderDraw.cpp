@@ -38,6 +38,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fmt/ranges.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1229,6 +1230,7 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 	}
 	auto&       cache   = context.GetTextureCache();
 	auto&       picks   = context.GetRenderTargetPick();
+	auto&       buffers_cache = context.GetBufferCache();
 	const auto* pair    = context.GetFlipWatch().PairForSlot(slot);
 	// The composite's shape: an unblended screen-covering quad. Its reads are the color inputs
 	// the flips should carry; the dumps rotate through them one per window.
@@ -1250,7 +1252,9 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 		if (stage == nullptr) {
 			continue;
 		}
+		uint32_t image_binding = 0;
 		for (const auto& image: stage->images) {
+			const auto binding_index = image_binding++;
 			if (!image.image_id) {
 				continue;
 			}
@@ -1267,11 +1271,11 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 				           static_cast<uint64_t>(ex.width) * ex.height};
 			}
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "flip-bind: pair slot={} desc addr=0x{:016x} size=0x{:x} fmt={} type={} view "
-			    "mip={} levels={} layer={} layers={} -> image addr=0x{:016x} "
+			    "flip-bind: pair slot={} binding={} desc addr=0x{:016x} size=0x{:x} fmt={} "
+			    "type={} view mip={} levels={} layer={} layers={} -> image addr=0x{:016x} "
 			    "serial=0x{:016x} fmt={} {}x{} levels={} layers={} gpu_modified={} "
-			    "video_out={}\n",
-			    slot, image.desc.info.data.address, image.desc.info.data.size,
+			    "imgdirty={} video_out={}\n",
+			    slot, binding_index, image.desc.info.data.address, image.desc.info.data.size,
 			    vk::to_string(image.desc.info.pixel_format),
 			    BindingTypeName(image.desc.type), image.desc.view_info.base_level,
 			    image.desc.view_info.level_count, image.desc.view_info.base_layer,
@@ -1279,7 +1283,49 @@ static void LogFlipWatchBindings(RenderContext&                     context,
 			    vk::to_string(resolved->info.pixel_format), resolved->info.extent.width,
 			    resolved->info.extent.height, resolved->info.resources.levels,
 			    resolved->info.resources.layers, resolved->IsGpuModified() ? "true" : "false",
+			    buffers_cache.HasGpuDirtyBytes(resolved->info.data.address,
+			                                   resolved->info.data.size) ? "true" : "false",
 			    resolved->usage.video_out ? "true" : "false"));
+		}
+	}
+	if (composite_shape) {
+		// The composite's pixel shader reads render parameters straight from guest memory
+		// through raw buffer bindings; a game updating those on the GPU leaves guest RAM
+		// stale, and every sampled color multiplied by such a scalar turns black. Compare the
+		// raw CPU view against the GPU-synced view, and probe the ladder's scalar dword.
+		constexpr uint64_t kScalarOffset = 2160;
+		for (const PreparedBindings* stage: stages) {
+			if (stage == nullptr) {
+				continue;
+			}
+			uint32_t buffer_binding = 0;
+			for (const auto& source: stage->buffer_sources) {
+				const auto              binding_index = buffer_binding++;
+				std::array<uint8_t, 16> raw {};
+				std::array<uint8_t, 16> synced {};
+				std::array<uint8_t, 16> scalar {};
+				const bool raw_ok =
+				    LibKernel::Memory::TryReadBacking(source.address, raw.data(), raw.size());
+				const bool synced_ok =
+				    GuestGpu::IsGpuThread() &&
+				    LibKernel::Memory::TryReadBufferBacking(source.address, synced.data(),
+				                                            synced.size());
+				const bool scalar_ok =
+				    LibKernel::Memory::TryReadBacking(source.address + kScalarOffset,
+				                                      scalar.data(), scalar.size());
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "flip-param: pair slot={} buffer={} addr=0x{:016x} size=0x{:x} dirty={} "
+				    "raw={} synced={} scalar={}\n",
+				    slot, binding_index, source.address, source.size,
+				    buffers_cache.HasGpuDirtyBytes(source.address, source.size) ? "true"
+				                                                                   : "false",
+				    raw_ok ? fmt::format("{:02x}", fmt::join(raw, " "))
+				           : std::string("<unreadable>"),
+				    synced_ok ? fmt::format("{:02x}", fmt::join(synced, " "))
+				              : std::string("<unreadable>"),
+				    scalar_ok ? fmt::format("{:02x}", fmt::join(scalar, " "))
+				              : std::string("<unreadable>")));
+			}
 		}
 	}
 	if (composite_shape && input_count > 0) {
