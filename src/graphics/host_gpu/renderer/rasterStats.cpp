@@ -130,8 +130,10 @@ void RasterSampleStats::Report() {
 					pair_totals[pair].samples += value;
 				}
 			} else if (pair < pair_totals.size()) {
-				pair_totals[pair] = PairTotals {tag, value == 0 ? 1 : 0, value != 0 ? 1 : 0,
-				                                value != 0 ? value : 0};
+				pair_totals[pair].tag     = tag;
+				pair_totals[pair].zero    = value == 0 ? 1 : 0;
+				pair_totals[pair].nonzero = value != 0 ? 1 : 0;
+				pair_totals[pair].samples = value != 0 ? value : 0;
 				pair_count++;
 			}
 		}
