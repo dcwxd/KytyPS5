@@ -8,9 +8,11 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
-// A private static copy of the writer: test targets link the presentation sources without
-// src/libs, where libPngEnc.cpp's shared implementation does not exist.
+// A private static copy of the writer: targets that link the presentation window sources may do
+// it without src/libs, and kyty_emulator's link has shown it cannot rely on libPngEnc.cpp's
+// implementation either. With everything static there is no symbol to collide or to miss.
 #define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 #include <chrono>
