@@ -1365,6 +1365,11 @@ static void PrintOneGuestHookHit(const GuestHookHit& hit) {
 	// The kernel loads its swizzle masks into ymm6..ymm11 right after entry (the <<5 mask belongs in
 	// ymm7). They are caller-saved, so dumping them shows whether the caller left the values the
 	// kernel assumes, or whether a broadcast was rewritten to the wrong register.
+	// The loop's shift counts: the prologue broadcasts desc[0x40] into xmm5 and desc[0x44] into
+	// xmm2 with vmovd, so only the first lane carries a count. Dumping them both says whether the
+	// loop shifts every lane or just the first one, and which field the count came from.
+	print_dwords("ymm2 at entry (count, desc[0x44]):", hit.vectors.data() + 2 * 32, 8);
+	print_dwords("ymm5 at entry (count, desc[0x40]):", hit.vectors.data() + 5 * 32, 8);
 	print_dwords("ymm6 at entry (mask <<3):", hit.vectors.data() + 6 * 32, 8);
 	print_dwords("ymm7 at entry (mask <<5, expect 0000030000000300):",
 	             hit.vectors.data() + 7 * 32, 8);
@@ -1409,6 +1414,49 @@ static void PrintGuestHookHits() {
 // The fault report runs after the copy loop has already stored over the live descriptor, so the
 // newest hit recorded before the fault — the call that crashed — is the only place its input is
 // still intact.
+// The hook fires at the top of the unrolled body, so one call produces one hit per iteration
+// (the step register r8 is 0x40 and rsi grows by it). Consecutive hits of the same call therefore
+// show how one iteration turns the index state into the offsets the next one uses, which is the
+// only way to tell a linear counter from a state that jumps by a block.
+static void PrintGuestHookIterationTrace(const GuestHookHit& newest) {
+	const uint64_t    total          = g_guest_hook_total.load(std::memory_order_acquire);
+	constexpr size_t  kMaxIterations = 8;
+	std::array<const GuestHookHit*, kMaxIterations> iterations {};
+	size_t                                 count = 0;
+	for (uint64_t sequence = total; sequence > 0 && count < kMaxIterations; sequence--) {
+		const auto& hit = g_guest_hook_ring[(sequence - 1) % g_guest_hook_ring.size()];
+		if (hit.sequence != sequence - 1) {
+			break;
+		}
+		// A new call starts whenever the surface base or the caller changes.
+		if (hit.rdi != newest.rdi || hit.return_address != newest.return_address) {
+			break;
+		}
+		iterations[count++] = &hit;
+	}
+	if (count < 2) {
+		return;
+	}
+	std::printf("   iterations of this call (oldest first):\n");
+	const auto print_vector = [](const char* label, const uint8_t* data) {
+		std::printf("     %s", label);
+		for (int i = 0; i < 8; i++) {
+			uint32_t value = 0;
+			std::memcpy(&value, data + i * 4, sizeof(value));
+			std::printf(" %08" PRIx32, value);
+		}
+		std::printf("\n");
+	};
+	for (size_t i = count; i > 0; i--) {
+		const auto& hit = *iterations[i - 1];
+		std::printf("   iter #%" PRIu64 " rsi=%08" PRIx32 "\n", hit.sequence,
+		            static_cast<uint32_t>(hit.rsi));
+		print_vector("ymm1  =", hit.vectors.data() + 1 * 32);
+		print_vector("ymm12 =", hit.vectors.data() + 12 * 32);
+		print_vector("ymm13 =", hit.vectors.data() + 13 * 32);
+	}
+}
+
 static void PrintFaultingGuestHookHit(uint64_t fault_rsp) {
 	const uint64_t total = g_guest_hook_total.load(std::memory_order_acquire);
 	if (total == 0) {
@@ -1428,6 +1476,7 @@ static void PrintFaultingGuestHookHit(uint64_t fault_rsp) {
 		            " (prologue pushes expect 0x30)\n",
 		            hit.rsp, fault_rsp, hit.rsp - fault_rsp);
 		PrintOneGuestHookHit(hit);
+		PrintGuestHookIterationTrace(hit);
 		// The callee spills the descriptor fields it loaded and the caller parks the index vector
 		// on its own frame. Comparing those live copies with the entry snapshot says whether the
 		// descriptor was rewritten after the hook ran.
