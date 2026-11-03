@@ -7,6 +7,8 @@
 [![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
+### Bunch of random fixes for RDNA 1. Vibe coded, I don't know what I'm doing xd.
+
 **[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes, and ongoing development.
 
 **[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
