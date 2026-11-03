@@ -23,6 +23,7 @@
 #include <bit>
 #include <cinttypes>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -830,12 +831,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                                                      : cached.info.resources.layers;
 		if (requested_slices == cached_slices && requested_slices != 0) {
 			if (Config::DebugDumpFlipEnabled()) {
-				LOGF("volume-unify: %s view of %s addr=0x%016" PRIx64 " fmt=%s %ux%u slices=%u"
-				     " levels=1\n",
-				     requested_volume ? "volume" : "array",
-				     requested_volume ? "array" : "volume",
-				     requested.data.address, vk::to_string(requested.pixel_format).c_str(),
-				     requested.extent.width, requested.extent.height, requested_slices);
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "volume-unify: {} view of {} addr=0x{:016x} fmt={} {}x{} slices={} "
+				    "levels=1\n",
+				    requested_volume ? "volume" : "array",
+				    requested_volume ? "array" : "volume", requested.data.address,
+				    vk::to_string(requested.pixel_format), requested.extent.width,
+				    requested.extent.height, requested_slices));
 			}
 			if (requested_volume) {
 				// Vulkan cannot view an array as a volume; promote the volume to the
@@ -2066,17 +2068,16 @@ void TextureCache::DebugReportLutOverlaps(uint64_t address, uint64_t size) {
 		if (image == nullptr || !image->registered || image->depth_id) {
 			continue;
 		}
-		LOGF("lut-overlap: serial=0x%016" PRIx64 " fmt=%s extent=%ux%ux%u layers=%u "
-		     "imgtype=%u addr=0x%016" PRIx64 " size=0x%016" PRIx64 " gpu_modified=%s "
-		     "buffer_modified=%s cpu_dirty=%s rt=%s\n",
-		     image->serial, vk::to_string(image->info.pixel_format).c_str(),
-		     image->info.extent.width, image->info.extent.height, image->info.extent.depth,
-		     image->info.resources.layers, static_cast<uint32_t>(image->info.type),
-		     image->info.data.address, image->info.data.size,
-		     image->IsGpuModified() ? "true" : "false",
-		     image->IsBufferModified() ? "true" : "false",
-		     image->IsCpuDirty() ? "true" : "false",
-		     image->usage.render_target ? "true" : "false");
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "lut-overlap: serial=0x{:016x} fmt={} extent={}x{}x{} layers={} imgtype={} "
+		    "addr=0x{:016x} size=0x{:x} gpu_modified={} buffer_modified={} cpu_dirty={} rt={}\n",
+		    image->serial, vk::to_string(image->info.pixel_format), image->info.extent.width,
+		    image->info.extent.height, image->info.extent.depth, image->info.resources.layers,
+		    static_cast<uint32_t>(image->info.type), image->info.data.address,
+		    image->info.data.size, image->IsGpuModified() ? "true" : "false",
+		    image->IsBufferModified() ? "true" : "false",
+		    image->IsCpuDirty() ? "true" : "false",
+		    image->usage.render_target ? "true" : "false"));
 	}
 }
 

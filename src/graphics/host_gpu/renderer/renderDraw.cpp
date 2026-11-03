@@ -44,6 +44,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -927,6 +928,8 @@ static void NoteScanOutSkip(FlipWatch& watch, const CommandBuffer& buffer,
 	}
 }
 
+static void ReportDroppedDrawTargets(const CommandBuffer& buffer, const DrawCallInfo& draw);
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -942,6 +945,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		CountDrawStats(true, false);
 		if (Config::DebugDumpFlipEnabled()) {
 			NoteScanOutSkip(m_context.GetFlipWatch(), buffer, draw, true);
+			ReportDroppedDrawTargets(buffer, draw);
 		}
 		return false;
 	}
@@ -1308,8 +1312,9 @@ static void ClearDebugLookupTables(RenderContext&                     context,
 	}
 }
 
-// Debug: the composite names the 3D-LUT guest range; once per session, list every cached
-// image overlapping it, so a producer that only ever bound an aliased shape is unmasked.
+// Debug: verify the dropped-draw report has something to compare against, even under a
+// plain dump-flip run: registering the range here lets the dropped-draw target scanner mark
+// its hits. The enumeration of everything overlapping the LUT stays with ClearDebugLookupTables.
 static void DebugReportLutOverlapsOnce(TextureCache&                      cache,
                                        std::span<PreparedBindings* const> stages) {
 	static std::atomic<bool> reported {false};
@@ -1331,10 +1336,49 @@ static void DebugReportLutOverlapsOnce(TextureCache&                      cache,
 				continue;
 			}
 			reported.store(true, std::memory_order_relaxed);
+			RegisterLutGuestRange(resolved->info.data.address, resolved->info.data.size);
 			cache.DebugReportLutOverlaps(resolved->info.data.address,
 			                             resolved->info.data.size);
 			return;
 		}
+	}
+}
+
+// Debug: no-vertex-stage draws are dropped before their targets resolve, so their
+// render-target registers are invisible to every other watch; a pass producing the composite
+// LUT as a mesh draw would surface nowhere else. Report each distinct target once, marking
+// addresses that fall inside the registered LUT range.
+static void ReportDroppedDrawTargets(const CommandBuffer& buffer, const DrawCallInfo& draw) {
+	static std::mutex                      lock;
+	static std::set<std::array<uint64_t, 6>> seen;
+	const auto&                            ctx = buffer.GetRegisters();
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = ctx.GetRenderTarget(slot);
+		if (rt.base.addr == 0) {
+			continue;
+		}
+		const std::array<uint64_t, 6> key {
+		    rt.base.addr,
+		    rt.attrib2.width,
+		    rt.attrib2.height,
+		    rt.attrib3.dimension,
+		    rt.attrib3.depth,
+		    (static_cast<uint64_t>(rt.info.format) << 32u) |
+		        static_cast<uint64_t>(rt.info.channel_type)};
+		{
+			const std::scoped_lock guard {lock};
+			if (!seen.emplace(key).second) {
+				continue;
+			}
+		}
+		const bool lut_hit = OverlapsRegisteredLutRange(rt.base.addr, 1);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "mesh-targets: slot={} addr=0x{:016x} w={} h={} dim={} depth={} fmt={} nfmt={} "
+		    "indices={} lut={}\n",
+		    slot, rt.base.addr, rt.attrib2.width + 1u, rt.attrib2.height + 1u,
+		    rt.attrib3.dimension, rt.attrib3.depth, static_cast<uint32_t>(rt.info.format),
+		    static_cast<uint32_t>(rt.info.channel_type), draw.index_count,
+		    lut_hit ? "true" : "false"));
 	}
 }
 
