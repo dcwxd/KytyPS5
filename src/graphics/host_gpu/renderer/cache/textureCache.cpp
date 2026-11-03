@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -567,6 +568,17 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
+	if (Config::DebugLutIdentityEnabled() &&
+	    OverlapsRegisteredLutRange(destination.info.data.address,
+	                              destination.info.data.size)) {
+		ReportLutRangeTouch(
+		    "copy", 0, 0, "copy-image", destination.info.data.address,
+		    destination.info.data.size, vk::to_string(destination.info.pixel_format).c_str(),
+		    destination.info.extent.width, destination.info.extent.height,
+		    destination.info.extent.depth, destination.info.resources.layers,
+		    static_cast<uint32_t>(destination.info.type), destination.IsGpuModified(),
+		    source.info.data.address);
+	}
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
@@ -613,6 +625,17 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	TrackImage(destination_id);
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
+	}
+	if (Config::DebugLutIdentityEnabled() &&
+	    OverlapsRegisteredLutRange(destination.info.data.address,
+	                              destination.info.data.size)) {
+		ReportLutRangeTouch(
+		    "copy-mip", 0, 0, "copy-image", destination.info.data.address,
+		    destination.info.data.size, vk::to_string(destination.info.pixel_format).c_str(),
+		    destination.info.extent.width, destination.info.extent.height,
+		    destination.info.extent.depth, destination.info.resources.layers,
+		    static_cast<uint32_t>(destination.info.type), destination.IsGpuModified(),
+		    source.info.data.address);
 	}
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
@@ -1559,6 +1582,10 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
                                         uint32_t packed_clear) {
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
+	}
+	if (Config::DebugLutIdentityEnabled() && OverlapsRegisteredLutRange(address, size)) {
+		ReportLutRangeTouch("imgfill", 0, 0, "image-clear", address, size, "-", 0, 0, 0, 0, 0,
+		                    false, packed_clear);
 	}
 	std::scoped_lock      lock {m_lock};
 	ImageId               selected {};

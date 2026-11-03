@@ -15,6 +15,8 @@
 #include <fmt/format.h>
 #include <mutex>
 #include <set>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -623,6 +625,117 @@ void ReportLutImageUse(const char* kind, uint64_t writer, uint32_t binding, cons
 	    "{}x{}x{} gpu_modified={}\n",
 	    kind, writer, binding, type, serial, address, width, height, depth,
 	    gpu_modified ? "true" : "false"));
+}
+
+namespace {
+std::mutex g_lut_range_lock;
+std::vector<std::pair<uint64_t, uint64_t>> g_lut_ranges;
+} // namespace
+
+void RegisterLutGuestRange(uint64_t address, uint64_t size) {
+	if (address == 0 || size == 0) {
+		return;
+	}
+	const std::scoped_lock lock {g_lut_range_lock};
+	for (const auto& known: g_lut_ranges) {
+		if (known.first == address && known.second == size) {
+			return;
+		}
+	}
+	if (g_lut_ranges.size() >= 16) {
+		return;
+	}
+	g_lut_ranges.emplace_back(address, size);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "lut-range: registered addr=0x{:016x} size=0x{:x}\n", address, size));
+}
+
+bool OverlapsRegisteredLutRange(uint64_t address, uint64_t size) {
+	if (address == 0 || size == 0) {
+		return false;
+	}
+	const std::scoped_lock lock {g_lut_range_lock};
+	for (const auto& known: g_lut_ranges) {
+		if (address < known.first + known.second && known.first < address + size) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ReportLutRangeTouch(const char* kind, uint64_t writer, uint32_t binding, const char* type,
+                         uint64_t address, uint64_t size, const char* format, uint32_t width,
+                         uint32_t height, uint32_t depth, uint32_t layers, uint32_t image_type,
+                         bool gpu_modified, uint64_t detail) {
+	struct Key {
+		uint64_t     writer;
+		uint64_t     address;
+		uint32_t     binding;
+		std::string  kind;
+		bool         operator<(const Key& other) const {
+			return writer != other.writer   ? writer < other.writer
+			       : address != other.address ? address < other.address
+			       : binding != other.binding  ? binding < other.binding
+			                                   : kind < other.kind;
+		}
+	};
+	static std::mutex lock;
+	static std::set<Key> seen;
+	{
+		const std::scoped_lock guard {lock};
+		if (!seen.emplace(Key {writer, address, binding, kind}).second) {
+			return;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "lut-hit: kind={} writer=0x{:016x} binding={} type={} addr=0x{:016x} size=0x{:x} fmt={} "
+	    "extent={}x{}x{} layers={} imgtype={} gpu_modified={} detail=0x{:016x}\n",
+	    kind, writer, binding, type, address, size, format, width, height, depth, layers,
+	    image_type, gpu_modified ? "true" : "false", detail));
+}
+
+namespace {
+template <size_t kMax>
+bool DedupShaderAddress(std::array<std::atomic<uint64_t>, kMax>& slots, uint64_t address) {
+	if (address == 0) {
+		return false;
+	}
+	for (auto& slot: slots) {
+		auto known = slot.load(std::memory_order_relaxed);
+		if (known == address) {
+			return false;
+		}
+		if (known == 0 &&
+		    slot.compare_exchange_strong(known, address, std::memory_order_relaxed)) {
+			return true;
+		}
+	}
+	return false;
+}
+} // namespace
+
+void ReportDispatchIndirectDropped(uint64_t shader_addr, uint64_t args_addr, uint32_t x,
+                                   uint32_t y, uint32_t z) {
+	static std::array<std::atomic<uint64_t>, 16> dropped {};
+	if (!DedupShaderAddress(dropped, shader_addr)) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "dispatch-indirect: DROPPED zero args shader-addr=0x{:016x} args_addr=0x{:016x} "
+	    "args={}x{}x{}\n",
+	    shader_addr, args_addr, x, y, z));
+}
+
+void ReportDispatchIndirectDispatched(uint64_t shader_addr, uint64_t args_addr,
+                                      bool args_gpu_dirty) {
+	static std::array<std::atomic<uint64_t>, 16> dispatched {};
+	if (!DedupShaderAddress(dispatched, shader_addr)) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "dispatch-indirect: dispatched shader-addr=0x{:016x} args_addr=0x{:016x} "
+	    "args_gpu_dirty={}\n",
+	    shader_addr, args_addr, args_gpu_dirty ? "true" : "false"));
 }
 
 static void VpPrint(const char* func, const HW::ScreenViewport& vp,

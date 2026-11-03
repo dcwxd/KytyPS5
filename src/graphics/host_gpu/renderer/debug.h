@@ -33,6 +33,23 @@ bool                     graphics_debug_dump_enabled();
 void ReportLutImageUse(const char* kind, uint64_t writer, uint32_t binding, const char* type,
                        uint64_t serial, uint64_t address, uint32_t width, uint32_t height,
                        uint32_t depth, bool gpu_modified);
+// Debug: the composite binds the 3D LUT by its own image identity, but a producing pass may
+// reach the same guest memory through a differently-shaped alias, a raw buffer, a copy, or an
+// image clear -- none of which carry the A2B10G10R10/32-deep signature. Register the LUT's
+// guest range once it is seen; afterwards report every unique touch of that range.
+void RegisterLutGuestRange(uint64_t address, uint64_t size);
+[[nodiscard]] bool OverlapsRegisteredLutRange(uint64_t address, uint64_t size);
+void ReportLutRangeTouch(const char* kind, uint64_t writer, uint32_t binding, const char* type,
+                         uint64_t address, uint64_t size, const char* format, uint32_t width,
+                         uint32_t height, uint32_t depth, uint32_t layers, uint32_t image_type,
+                         bool gpu_modified, uint64_t detail);
+// Debug: indirect compute dispatches bypass the direct-dispatch LUT watch, and one whose
+// argument words read as zero is silently skipped. Keep both facts observable, once per
+// guest compute-shader address, under the identity-test flag.
+void ReportDispatchIndirectDropped(uint64_t shader_addr, uint64_t args_addr, uint32_t x,
+                                   uint32_t y, uint32_t z);
+void ReportDispatchIndirectDispatched(uint64_t shader_addr, uint64_t args_addr,
+                                      bool args_gpu_dirty);
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
 std::string              rt_print(const char* func, const HW::RenderTarget& rt);

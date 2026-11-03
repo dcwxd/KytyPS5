@@ -1239,42 +1239,71 @@ static void ClearDebugLookupTables(RenderContext&                     context,
 		if (stage == nullptr) {
 			continue;
 		}
+		const uint64_t writer =
+		    stage_id < writers.size() ? writers[stage_id] : static_cast<uint64_t>(-1);
 		for (uint32_t binding_index = 0; binding_index < stage->images.size(); binding_index++) {
 			const auto& image = stage->images[binding_index];
 			if (!image.image_id) {
 				continue;
 			}
 			auto* resolved = cache.TryGetImage(image.image_id);
-			if (resolved == nullptr ||
-			    resolved->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
-			    resolved->info.extent.depth != 32) {
+			if (resolved == nullptr) {
 				continue;
 			}
-			const uint64_t writer =
-			    stage_id < writers.size() ? writers[stage_id] : static_cast<uint64_t>(-1);
-			ReportLutImageUse("graphics", writer, binding_index, BindingTypeName(image.desc.type),
-			                  resolved->serial, resolved->info.data.address,
-			                  resolved->info.extent.width, resolved->info.extent.height,
-			                  resolved->info.extent.depth, resolved->IsGpuModified());
-			vk::ClearColorValue color {};
-			color.float32[0] = 0.25f;
-			color.float32[1] = 0.50f;
-			color.float32[2] = 0.75f;
-			color.float32[3] = 1.0f;
-			const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-			resolved->Transit(vk::ImageLayout::eTransferDstOptimal,
-			                  vk::AccessFlagBits2::eTransferWrite, {}, command);
-			command.clearColorImage(resolved->backing.image, vk::ImageLayout::eTransferDstOptimal,
-			                        &color, 1, &range);
-			resolved->Transit(resolved->ReadLayout(), vk::AccessFlagBits2::eShaderRead, {},
-			                  command);
-			cache.MarkGpuWritten(image.image_id);
-			if (reported.fetch_add(1, std::memory_order_relaxed) == 0) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "debug: lut identity test active, cleared image addr=0x{:016x} "
-				    "serial=0x{:016x}\n",
-				    resolved->info.data.address, resolved->serial));
+			if (resolved->info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 &&
+			    resolved->info.extent.depth == 32) {
+				RegisterLutGuestRange(resolved->info.data.address, resolved->info.data.size);
+				ReportLutImageUse("graphics", writer, binding_index,
+				                  BindingTypeName(image.desc.type), resolved->serial,
+				                  resolved->info.data.address, resolved->info.extent.width,
+				                  resolved->info.extent.height, resolved->info.extent.depth,
+				                  resolved->IsGpuModified());
+				vk::ClearColorValue color {};
+				color.float32[0] = 0.25f;
+				color.float32[1] = 0.50f;
+				color.float32[2] = 0.75f;
+				color.float32[3] = 1.0f;
+				const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+				resolved->Transit(vk::ImageLayout::eTransferDstOptimal,
+				                  vk::AccessFlagBits2::eTransferWrite, {}, command);
+				command.clearColorImage(resolved->backing.image,
+				                        vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
+				resolved->Transit(resolved->ReadLayout(), vk::AccessFlagBits2::eShaderRead, {},
+				                  command);
+				cache.MarkGpuWritten(image.image_id);
+				if (reported.fetch_add(1, std::memory_order_relaxed) == 0) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "debug: lut identity test active, cleared image addr=0x{:016x} "
+					    "serial=0x{:016x}\n",
+					    resolved->info.data.address, resolved->serial));
+				}
+				continue;
 			}
+			// Any other image sharing the LUT's guest memory is an alias through which a
+			// producing pass may write what the composite later reads as black.
+			if (!OverlapsRegisteredLutRange(resolved->info.data.address,
+			                                resolved->info.data.size)) {
+				continue;
+			}
+			ReportLutRangeTouch("graphics", writer, binding_index,
+			                    BindingTypeName(image.desc.type), resolved->info.data.address,
+			                    resolved->info.data.size,
+			                    vk::to_string(resolved->info.pixel_format).c_str(),
+			                    resolved->info.extent.width, resolved->info.extent.height,
+			                    resolved->info.extent.depth, resolved->info.resources.layers,
+			                    static_cast<uint32_t>(resolved->info.type),
+			                    resolved->IsGpuModified(), 0);
+		}
+		// Raw buffer bindings whose guest range covers the LUT memory would rewrite it
+		// without ever touching an image binding.
+		for (uint32_t binding_index = 0; binding_index < stage->buffer_sources.size();
+		     binding_index++) {
+			const auto& source = stage->buffer_sources[binding_index];
+			if (!OverlapsRegisteredLutRange(source.address, source.size)) {
+				continue;
+			}
+			ReportLutRangeTouch("graphics-buffer", writer, binding_index, "buffer", source.address,
+			                    source.size, "-", 0, 0, 0, 0, 0, false, source.id.index);
 		}
 	}
 }
@@ -1488,17 +1517,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			        ? state.ps_input_info.stage.module->id
 			        : 0;
 		}
-		// Render targets reach the LUT through color_info rather than image bindings.
+		// Render targets reach the LUT through color_info rather than image bindings; a
+		// producing pass may also target an aliased view with a different shape or format.
 		for (uint32_t i = 0; i < state.color_count; i++) {
 			const auto& target = state.color_info[i];
-			if (target.desc.info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
-			    target.desc.info.extent.depth != 32) {
+			const auto& range  = target.desc.info.data;
+			if (!OverlapsRegisteredLutRange(range.address, range.size)) {
 				continue;
 			}
-			ReportLutImageUse(
-			    "graphics-target", writers[0], i, "render-target", 0,
-			    target.desc.info.data.address, target.desc.info.extent.width,
-			    target.desc.info.extent.height, target.desc.info.extent.depth, false);
+			ReportLutRangeTouch("graphics-target", writers[0], i, "render-target", range.address,
+			                    range.size, vk::to_string(target.desc.info.pixel_format).c_str(),
+			                    target.desc.info.extent.width, target.desc.info.extent.height,
+			                    target.desc.info.extent.depth,
+			                    target.desc.info.resources.layers,
+			                    static_cast<uint32_t>(target.desc.info.type), false, 0);
 		}
 		ClearDebugLookupTables(m_context, stages, std::span {writers.data(), writer_count},
 		                       buffer);
@@ -1921,6 +1953,20 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 			    dst.desc.view_info.base_level, dst.desc.view_info.base_layer,
 			    src.desc.info.data.address, src_extent.width, src_extent.height,
 			    src.desc.view_info.base_level, src.desc.view_info.base_layer));
+		}
+	}
+	if (Config::DebugLutIdentityEnabled()) {
+		// A color-control resolve whose destination overlaps the LUT rewrites it without an
+		// image binding or a render pass.
+		if (OverlapsRegisteredLutRange(dst.desc.info.data.address,
+		                               dst.desc.info.data.size)) {
+			ReportLutRangeTouch("cc-resolve", 0, 1, "render-target",
+			                    dst.desc.info.data.address, dst.desc.info.data.size,
+			                    vk::to_string(dst.desc.info.pixel_format).c_str(),
+			                    dst.desc.info.extent.width, dst.desc.info.extent.height,
+			                    dst.desc.info.extent.depth, dst.desc.info.resources.layers,
+			                    static_cast<uint32_t>(dst.desc.info.type), false,
+			                    src.desc.info.data.address);
 		}
 	}
 	cache.MarkGpuWritten(dst.image_id);

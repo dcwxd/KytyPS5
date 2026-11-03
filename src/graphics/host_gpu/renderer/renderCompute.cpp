@@ -406,18 +406,44 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				continue;
 			}
 			auto* resolved = cache.TryGetImage(image.image_id);
-			if (resolved == nullptr ||
-			    resolved->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
-			    resolved->info.extent.depth != 32) {
+			if (resolved == nullptr) {
 				continue;
 			}
-			ReportLutImageUse("compute", writer, binding_index,
-			                  image.desc.type == TextureCache::BindingType::Storage
-			                  ? "storage"
-			                  : "texture",
-			                  resolved->serial, resolved->info.data.address,
-			                  resolved->info.extent.width, resolved->info.extent.height,
-			                  resolved->info.extent.depth, resolved->IsGpuModified());
+			if (resolved->info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 &&
+			    resolved->info.extent.depth == 32) {
+				RegisterLutGuestRange(resolved->info.data.address, resolved->info.data.size);
+				ReportLutImageUse("compute", writer, binding_index,
+				                  image.desc.type == TextureCache::BindingType::Storage
+				                  ? "storage"
+				                  : "texture",
+				                  resolved->serial, resolved->info.data.address,
+				                  resolved->info.extent.width, resolved->info.extent.height,
+				                  resolved->info.extent.depth, resolved->IsGpuModified());
+				continue;
+			}
+			if (!OverlapsRegisteredLutRange(resolved->info.data.address,
+			                                resolved->info.data.size)) {
+				continue;
+			}
+			ReportLutRangeTouch("compute", writer, binding_index,
+			                   image.desc.type == TextureCache::BindingType::Storage
+			                   ? "storage"
+			                   : "texture",
+			                   resolved->info.data.address, resolved->info.data.size,
+			                   vk::to_string(resolved->info.pixel_format).c_str(),
+			                   resolved->info.extent.width, resolved->info.extent.height,
+			                   resolved->info.extent.depth, resolved->info.resources.layers,
+			                   static_cast<uint32_t>(resolved->info.type),
+			                   resolved->IsGpuModified(), 0);
+		}
+		for (uint32_t binding_index = 0; binding_index < bindings.buffer_sources.size();
+		     binding_index++) {
+			const auto& source = bindings.buffer_sources[binding_index];
+			if (!OverlapsRegisteredLutRange(source.address, source.size)) {
+				continue;
+			}
+			ReportLutRangeTouch("compute-buffer", writer, binding_index, "buffer", source.address,
+			                    source.size, "-", 0, 0, 0, 0, 0, false, source.id.index);
 		}
 	}
 	BindSharedMemory(m_context, input_info, bindings);
@@ -541,10 +567,20 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	const bool args_gpu_dirty =
+	    m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args));
+	const uint64_t indirect_shader_addr = buffer.GetShaders().GetCs().cs_regs.data_addr;
+	if (!args_gpu_dirty &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
+		if (Config::DebugLutIdentityEnabled()) {
+			ReportDispatchIndirectDropped(indirect_shader_addr, args_addr, args.x, args.y,
+			                              args.z);
+		}
 		return;
+	}
+	if (Config::DebugLutIdentityEnabled()) {
+		ReportDispatchIndirectDispatched(indirect_shader_addr, args_addr, args_gpu_dirty);
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
@@ -572,6 +608,58 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
+	if (Config::DebugLutIdentityEnabled()) {
+		// Indirect compute bypasses the direct-dispatch watch; mirror it here so a LUT
+		// generator dispatched indirectly is still reported.
+		auto&       cache   = m_context.GetTextureCache();
+		const auto  writer  = input_info.stage.module != nullptr
+			                     ? input_info.stage.module->id
+			                     : static_cast<uint64_t>(0);
+		uint32_t    index   = 0;
+		for (const auto& image: bindings.images) {
+			const auto binding_index = index++;
+			if (!image.image_id) {
+				continue;
+			}
+			auto* resolved = cache.TryGetImage(image.image_id);
+			if (resolved == nullptr) {
+				continue;
+			}
+			const char* type = image.desc.type == TextureCache::BindingType::Storage
+			                     ? "storage"
+			                     : "texture";
+			if (resolved->info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 &&
+			    resolved->info.extent.depth == 32) {
+				RegisterLutGuestRange(resolved->info.data.address, resolved->info.data.size);
+				ReportLutImageUse("compute-indirect", writer, binding_index, type,
+				                  resolved->serial, resolved->info.data.address,
+				                  resolved->info.extent.width, resolved->info.extent.height,
+				                  resolved->info.extent.depth, resolved->IsGpuModified());
+				continue;
+			}
+			if (!OverlapsRegisteredLutRange(resolved->info.data.address,
+			                                resolved->info.data.size)) {
+				continue;
+			}
+			ReportLutRangeTouch("compute-indirect", writer, binding_index, type,
+			                    resolved->info.data.address, resolved->info.data.size,
+			                    vk::to_string(resolved->info.pixel_format).c_str(),
+			                    resolved->info.extent.width, resolved->info.extent.height,
+			                    resolved->info.extent.depth, resolved->info.resources.layers,
+			                    static_cast<uint32_t>(resolved->info.type),
+			                    resolved->IsGpuModified(), 0);
+		}
+		for (uint32_t binding_index = 0; binding_index < bindings.buffer_sources.size();
+		     binding_index++) {
+			const auto& source = bindings.buffer_sources[binding_index];
+			if (!OverlapsRegisteredLutRange(source.address, source.size)) {
+				continue;
+			}
+			ReportLutRangeTouch("compute-indirect-buffer", writer, binding_index, "buffer",
+			                    source.address, source.size, "-", 0, 0, 0, 0, 0, false,
+			                    source.id.index);
+		}
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);

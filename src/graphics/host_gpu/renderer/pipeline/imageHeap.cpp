@@ -2,10 +2,12 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -448,6 +450,39 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	auto&      textures = m_context.GetTextureCache();
 	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
 	const auto serial   = Image::serials.load(std::memory_order_relaxed);
+	if (Config::DebugLutIdentityEnabled()) {
+		// Heap-resolved images never enter bindings.images, so the dispatch watches miss them;
+		// report any element touching the LUT range (writes hide here).
+		for (const auto* view: m_active) {
+			for (const auto& [value, index]: view->elements) {
+				const auto& binding = m_elements[index].binding;
+				if (!binding.image_id) {
+					continue;
+				}
+				const auto* image = ImageOf(m_elements[index]);
+				if (image == nullptr) {
+					continue;
+				}
+				if (image->info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 &&
+				    image->info.extent.depth == 32) {
+					RegisterLutGuestRange(image->info.data.address, image->info.data.size);
+				}
+				if (!OverlapsRegisteredLutRange(image->info.data.address,
+				                                image->info.data.size)) {
+					continue;
+				}
+				ReportLutRangeTouch(
+				    "image-heap", 0, index,
+				    binding.desc.type == TextureCache::BindingType::Storage ? "storage"
+				                                                            : "texture",
+				    image->info.data.address, image->info.data.size,
+				    vk::to_string(image->info.pixel_format).c_str(), image->info.extent.width,
+				    image->info.extent.height, image->info.extent.depth,
+				    image->info.resources.layers, static_cast<uint32_t>(image->info.type),
+				    image->IsGpuModified(), m_elements[index].kind);
+			}
+		}
+	}
 	for (auto* view: m_active) {
 		bool       stale = false;
 		const auto mark  = [&](uint32_t index) { m_elements[index].stale = stale = true; };
