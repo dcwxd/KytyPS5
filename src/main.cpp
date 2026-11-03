@@ -108,6 +108,8 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --lut-neutral-fill                   Fill GPU-generated grading LUTs the host cannot\n"
+	         "                                       produce (mesh draws) with a neutral UE filmic LUT.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -238,6 +240,7 @@ static constexpr Flag FLAGS[] = {
     {"--debug-sample-stats", &ConfigOptions::debug_sample_stats},
     {"--debug-dump-flip", &ConfigOptions::debug_dump_flip},
     {"--debug-lut-identity", &ConfigOptions::debug_lut_identity},
+    {"--lut-neutral-fill", &ConfigOptions::lut_neutral_fill},
 };
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {

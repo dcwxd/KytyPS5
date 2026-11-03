@@ -22,6 +22,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -2079,6 +2080,149 @@ void TextureCache::DebugReportLutOverlaps(uint64_t address, uint64_t size) {
 		    image->IsCpuDirty() ? "true" : "false",
 		    image->usage.render_target ? "true" : "false"));
 	}
+}
+
+namespace {
+
+// Workaround payload for NeutralLutFill: what the composite's 32-deep grading LUT would
+// contain if the mesh-shader pass that generates it had run. The consumer addresses the
+// table per channel with u = clamp(0.0714*log2(x) + 0.6107, 0, 1), so the scene value at
+// texel centers u = (i + 0.5)/32 is x = 2^(14u - 8.5498); grade it with the filmic curve
+// and constants of Unreal's default Filmic tonemapper, white-point normalized, then sRGB
+// encode the display result. A neutral grade acts per channel, so every axis of the table
+// carries the same sampled curve.
+[[nodiscard]] std::vector<uint32_t> BuildNeutralGradingLut() {
+	constexpr float kLogScale  = 14.0f;
+	constexpr float kLogOffset = 8.5498f;
+	constexpr float kShoulderA = 0.15f;
+	constexpr float kShoulderB = 0.50f;
+	constexpr float kShoulderC = 0.10f;
+	constexpr float kShoulderD = 0.20f;
+	constexpr float kShoulderE = 0.02f;
+	constexpr float kShoulderF = 0.30f;
+	constexpr float kShoulderW = 11.2f;
+	const auto filmic = [](float x) {
+		return ((x * (kShoulderA * x + kShoulderC * kShoulderB) + kShoulderD * kShoulderE) /
+		        (x * (kShoulderA * x + kShoulderB) + kShoulderD * kShoulderF)) -
+		       kShoulderE / kShoulderF;
+	};
+	const float white = filmic(kShoulderW);
+	const auto encode = [](float x) {
+		x = std::clamp(x, 0.0f, 1.0f);
+		return x <= 0.0031308f ? 12.92f * x : 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
+	};
+	std::array<float, 32> axis {};
+	for (uint32_t i = 0; i < axis.size(); i++) {
+		const float u     = (static_cast<float>(i) + 0.5f) / static_cast<float>(axis.size());
+		const float scene = std::pow(2.0f, kLogScale * u - kLogOffset);
+		axis[i]           = encode(filmic(scene) / white);
+	}
+	std::vector<uint32_t> texels;
+	texels.reserve(axis.size() * axis.size() * axis.size());
+	const auto quantize = [](float value) {
+		return static_cast<uint32_t>(std::lround(value * 1023.0f));
+	};
+	for (uint32_t z = 0; z < axis.size(); z++) {
+		for (uint32_t y = 0; y < axis.size(); y++) {
+			for (uint32_t x = 0; x < axis.size(); x++) {
+				const auto r = quantize(axis[x]);
+				const auto g = quantize(axis[y]);
+				const auto b = quantize(axis[z]);
+				// Host A2B10G10R10 packing: alpha in the two high bits.
+				texels.push_back(0xc0000000u | (b << 20u) | (g << 10u) | r);
+			}
+		}
+	}
+	return texels;
+}
+
+} // namespace
+
+void TextureCache::NeutralLutFill(Image& image) {
+	const auto& info = image.info;
+	// The generator's signature: the composite's 32-deep A2B10G10R10 volume.
+	if (info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+	    info.guest_format != Prospero::BufferFormat::k2_10_10_10UNorm ||
+	    info.extent.width != 32 || info.extent.height != 32 || info.extent.depth != 32 ||
+	    info.resources.levels != 1 || info.resources.layers > 1 || info.samples != 1 ||
+	    info.bytes_per_block != 4) {
+		return;
+	}
+	// A host that runs the game's mesh-shader generator fills the real table; standing in
+	// for it there would overwrite the game's own grading.
+	if (m_graphics.mesh_shader_enabled) {
+		return;
+	}
+	{
+		static std::mutex               serial_lock;
+		static std::unordered_set<uint64_t> filled;
+		std::scoped_lock lock {serial_lock};
+		if (!filled.insert(image.serial).second) {
+			return;
+		}
+	}
+	const auto texels = BuildNeutralGradingLut();
+	const auto copies = info.BufferCopies(0, 1);
+	if (copies.empty() || copies.size() > info.extent.depth || copies.front().bufferRowLength < 32) {
+		return;
+	}
+	// Lay the staged rows and slices out exactly as the upload will read them.
+	const uint64_t base = copies.front().bufferOffset;
+	const uint64_t row_bytes =
+	    static_cast<uint64_t>(copies.front().bufferRowLength) * info.bytes_per_block;
+	uint64_t slice_bytes = 0;
+	if (copies.size() == 1) {
+		slice_bytes = static_cast<uint64_t>(copies.front().bufferImageHeight) * row_bytes;
+	} else {
+		slice_bytes = copies.back().bufferOffset - copies.front().bufferOffset;
+	}
+	if (row_bytes < 32u * info.bytes_per_block || slice_bytes < 32u * row_bytes ||
+	    slice_bytes > info.data.size) {
+		return;
+	}
+	const uint64_t span = base + 31u * slice_bytes + 32u * row_bytes;
+	if (span > info.data.size) {
+		return;
+	}
+	// Guest-linear images refresh from guest memory: write the table there, in the guest's
+	// component order, and let the ordinary refresh upload it like any CPU-written texture.
+	const bool guest_linear = !info.IsTiled() && !image.IsBufferModified() &&
+	                          info.metadata.compression == VideoOutCompression::Uncompressed &&
+	                          GuestRange {info.data.address + base, span - base}.Valid();
+	std::vector<uint8_t> staging(static_cast<size_t>(span), 0);
+	for (uint32_t z = 0; z < info.extent.depth; z++) {
+		const uint64_t slice_start = base + z * slice_bytes;
+		for (uint32_t y = 0; y < info.extent.height; y++) {
+			uint64_t row = slice_start + y * row_bytes;
+			for (uint32_t x = 0; x < info.extent.width; x++) {
+				uint32_t word = texels[(static_cast<size_t>(z) * 32u + y) * 32u + x];
+				if (guest_linear) {
+					// The guest keeps the 2-bit component in the low bits; detile rotates.
+					word = std::rotr(word, 30u);
+				}
+				std::memcpy(&staging[static_cast<size_t>(row)], &word, sizeof(word));
+				row += sizeof(word);
+			}
+		}
+	}
+	if (guest_linear && Libs::LibKernel::Memory::TryWriteBacking(
+	                        info.data.address + base, staging.data(), staging.size())) {
+		image.MarkCpuDirty();
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "lut-fill: neutral grading LUT written to guest memory addr=0x{:016x} "
+		    "serial=0x{:016x} row=0x{:x} slice=0x{:x} span=0x{:x}\n",
+		    info.data.address + base, image.serial, row_bytes, slice_bytes, staging.size()));
+		return;
+	}
+	// Tiled or compressed layouts have no CPU-side packing: upload the host-ordered table
+	// straight into the image, mirroring what InitializeImage does for guest memory.
+	auto&       stream = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Stream);
+	const auto  offset = stream.Copy(staging.data(), staging.size(), 16);
+	image.Upload(info.BufferCopies(offset, 1), stream.Handle(), offset, staging.size());
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "lut-fill: neutral grading LUT uploaded directly addr=0x{:016x} serial=0x{:016x} "
+	    "row=0x{:x} slice=0x{:x} span=0x{:x}\n",
+	    info.data.address, image.serial, row_bytes, slice_bytes, staging.size()));
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {

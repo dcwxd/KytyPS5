@@ -1312,6 +1312,28 @@ static void ClearDebugLookupTables(RenderContext&                     context,
 	}
 }
 
+// Workaround: stand in for the game's mesh-shader LUT generator once the composite first
+// binds its (empty) grading table, filling it with a neutral filmic curve on hosts that
+// dropped the generating draw.
+static void NeutralFillLookupTables(RenderContext&                     context,
+                                    std::span<PreparedBindings* const> stages) {
+	auto& cache = context.GetTextureCache();
+	for (const PreparedBindings* const stage: stages) {
+		if (stage == nullptr) {
+			continue;
+		}
+		for (const auto& image: stage->images) {
+			if (!image.image_id) {
+				continue;
+			}
+			auto* resolved = cache.TryGetImage(image.image_id);
+			if (resolved != nullptr) {
+				cache.NeutralLutFill(*resolved);
+			}
+		}
+	}
+}
+
 // Debug: verify the dropped-draw report has something to compare against, even under a
 // plain dump-flip run: registering the range here lets the dropped-draw target scanner mark
 // its hits. The enumeration of everything overlapping the LUT stays with ClearDebugLookupTables.
@@ -1576,6 +1598,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	if (Config::LutNeutralFillEnabled()) {
+		NeutralFillLookupTables(m_context, stages);
+	}
 	if (Config::DebugLutIdentityEnabled()) {
 		std::array<uint64_t, 8> writers {};
 		uint32_t                writer_count = 0;

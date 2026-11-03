@@ -78,6 +78,11 @@ public:
 	// Debug: list every cached image overlapping a guest range, once per call site; a LUT
 	// producer that only ever bound an aliased shape leaves its resident image here.
 	void DebugReportLutOverlaps(uint64_t address, uint64_t size);
+	// Workaround: the game's grading LUT (a 32-deep A2B10G10R10 volume) is generated on the
+	// GPU by a mesh-shader draw; hosts without mesh shaders drop that draw and the table
+	// stays empty, blacking out the composite that samples it. Synthesize a neutral filmic
+	// LUT once per image and stage it exactly as a guest upload would.
+	void NeutralLutFill(Image& image);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);

@@ -233,6 +233,10 @@ bool DebugLutIdentityEnabled() {
 	return g_config->debug_lut_identity;
 }
 
+bool LutNeutralFillEnabled() {
+	return g_config->lut_neutral_fill;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

@@ -99,6 +99,9 @@ struct ConfigOptions {
 	bool                   debug_sample_stats          = false;
 	bool                   debug_dump_flip             = false;
 	bool                   debug_lut_identity          = false;
+	// Stand-in for GPU-generated grading LUTs on hosts that cannot run their mesh-shader
+	// producer; see TextureCache::NeutralLutFill.
+	bool                   lut_neutral_fill            = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -176,6 +179,7 @@ bool DebugBlendOneEnabled();
 bool DebugSampleStatsEnabled();
 bool DebugDumpFlipEnabled();
 bool DebugLutIdentityEnabled();
+bool LutNeutralFillEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
