@@ -1317,6 +1317,11 @@ static void ClearDebugLookupTables(RenderContext&                     context,
 // dropped the generating draw.
 static void NeutralFillLookupTables(RenderContext&                     context,
                                     std::span<PreparedBindings* const> stages) {
+	static std::atomic<bool> announced {false};
+	if (!announced.exchange(true, std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog(
+		    "lut-fill: neutral fill armed, watching draws for the grading LUT\n");
+	}
 	auto& cache = context.GetTextureCache();
 	for (const PreparedBindings* const stage: stages) {
 		if (stage == nullptr) {

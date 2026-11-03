@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cmath>
@@ -2070,11 +2071,15 @@ void TextureCache::DebugReportLutOverlaps(uint64_t address, uint64_t size) {
 			continue;
 		}
 		Log::WriteToConsoleAndLog(fmt::format(
-		    "lut-overlap: serial=0x{:016x} fmt={} extent={}x{}x{} layers={} imgtype={} "
+		    "lut-overlap: serial=0x{:016x} fmt={} extent={}x{}x{} layers={} levels={} "
+		    "imgtype={} guest_fmt={} tile_mode={} pitch={} slice_stride=0x{:x} "
 		    "addr=0x{:016x} size=0x{:x} gpu_modified={} buffer_modified={} cpu_dirty={} rt={}\n",
 		    image->serial, vk::to_string(image->info.pixel_format), image->info.extent.width,
 		    image->info.extent.height, image->info.extent.depth, image->info.resources.layers,
-		    static_cast<uint32_t>(image->info.type), image->info.data.address,
+		    image->info.resources.levels, static_cast<uint32_t>(image->info.type),
+		    static_cast<uint32_t>(image->info.guest_format),
+		    static_cast<uint32_t>(image->info.tile_mode), image->info.pitch,
+		    image->info.linear_slice_stride, image->info.data.address,
 		    image->info.data.size, image->IsGpuModified() ? "true" : "false",
 		    image->IsBufferModified() ? "true" : "false",
 		    image->IsCpuDirty() ? "true" : "false",
@@ -2140,17 +2145,23 @@ namespace {
 
 void TextureCache::NeutralLutFill(Image& image) {
 	const auto& info = image.info;
-	// The generator's signature: the composite's 32-deep A2B10G10R10 volume.
+	// The generator's signature: the composite's 32-deep A2B10G10R10 volume. The guest
+	// format and mip count are deliberately not screened; both print below if anything
+	// else about the layout keeps the fill from staging.
 	if (info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
-	    info.guest_format != Prospero::BufferFormat::k2_10_10_10UNorm ||
 	    info.extent.width != 32 || info.extent.height != 32 || info.extent.depth != 32 ||
-	    info.resources.levels != 1 || info.resources.layers > 1 || info.samples != 1 ||
-	    info.bytes_per_block != 4) {
+	    info.resources.layers > 1 || info.samples != 1 || info.bytes_per_block != 4 ||
+	    info.resources.levels == 0 || info.resources.levels > info.mip_layout.size()) {
 		return;
 	}
 	// A host that runs the game's mesh-shader generator fills the real table; standing in
 	// for it there would overwrite the game's own grading.
 	if (m_graphics.mesh_shader_enabled) {
+		static std::atomic<bool> reported {false};
+		if (!reported.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(
+			    "lut-fill: host runs mesh shaders, leaving the game's grading LUT alone\n");
+		}
 		return;
 	}
 	{
@@ -2161,33 +2172,59 @@ void TextureCache::NeutralLutFill(Image& image) {
 			return;
 		}
 	}
+	const auto report = [this, &info, &image](const char* reason, uint64_t base,
+	                                          uint64_t row_bytes, uint64_t slice_bytes,
+	                                          uint64_t span, size_t copies) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "lut-fill: rejected serial=0x{:016x} reason={} copies={} base=0x{:x} row=0x{:x} "
+		    "slice=0x{:x} span=0x{:x} data_size=0x{:x} tiled={} levels={} layers={} "
+		    "guest_fmt={} tile_mode={} pitch={} linear_pitch={} linear_size=0x{:x} "
+		    "slice_stride=0x{:x}\n",
+		    image.serial, reason, copies, base, row_bytes, slice_bytes, span, info.data.size,
+		    info.IsTiled() ? "true" : "false", info.resources.levels, info.resources.layers,
+		    static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+		    info.pitch,
+		    info.mip_layout.empty() ? 0u : info.mip_layout[0].linear_pitch,
+		    info.mip_layout.empty() ? 0u : info.mip_layout[0].linear_size,
+		    info.linear_slice_stride));
+	};
 	const auto texels = BuildNeutralGradingLut();
 	const auto copies = info.BufferCopies(0, 1);
-	if (copies.empty() || copies.size() > info.extent.depth || copies.front().bufferRowLength < 32) {
+	if (copies.empty()) {
+		report("no-copies", 0, 0, 0, 0, 0);
 		return;
 	}
-	// Lay the staged rows and slices out exactly as the upload will read them.
+	// Lay the staged rows and slices out exactly as the upload will read them; a zero row
+	// length or height means the copy region is tightly packed to the image extent.
 	const uint64_t base = copies.front().bufferOffset;
-	const uint64_t row_bytes =
-	    static_cast<uint64_t>(copies.front().bufferRowLength) * info.bytes_per_block;
+	const uint32_t row_length =
+	    copies.front().bufferRowLength != 0 ? copies.front().bufferRowLength : info.extent.width;
+	const uint64_t row_bytes = static_cast<uint64_t>(row_length) * info.bytes_per_block;
+	const uint64_t rows_per_slice = copies.size() == 1
+	                                    ? (copies.front().bufferImageHeight != 0
+	                                           ? copies.front().bufferImageHeight
+	                                           : info.extent.height)
+	                                    : 32u;
 	uint64_t slice_bytes = 0;
 	if (copies.size() == 1) {
-		slice_bytes = static_cast<uint64_t>(copies.front().bufferImageHeight) * row_bytes;
+		slice_bytes = rows_per_slice * row_bytes;
 	} else {
 		slice_bytes = copies.back().bufferOffset - copies.front().bufferOffset;
 	}
-	if (row_bytes < 32u * info.bytes_per_block || slice_bytes < 32u * row_bytes ||
-	    slice_bytes > info.data.size) {
-		return;
-	}
 	const uint64_t span = base + 31u * slice_bytes + 32u * row_bytes;
-	if (span > info.data.size) {
+	if (row_bytes < 32u * info.bytes_per_block || slice_bytes < 32u * row_bytes ||
+	    slice_bytes > info.data.size || span > info.data.size) {
+		report("layout", base, row_bytes, slice_bytes, span, copies.size());
 		return;
 	}
 	// Guest-linear images refresh from guest memory: write the table there, in the guest's
 	// component order, and let the ordinary refresh upload it like any CPU-written texture.
+	const ColorTransform transform   = info.GetColorTransform();
+	const bool           rotate      = transform == ColorTransform::Rotate2_10_10_10;
 	const bool guest_linear = !info.IsTiled() && !image.IsBufferModified() &&
 	                          info.metadata.compression == VideoOutCompression::Uncompressed &&
+	                          transform != ColorTransform::Reverse10_11_11 &&
+	                          transform != ColorTransform::SwapBgra16 &&
 	                          GuestRange {info.data.address + base, span - base}.Valid();
 	std::vector<uint8_t> staging(static_cast<size_t>(span), 0);
 	for (uint32_t z = 0; z < info.extent.depth; z++) {
@@ -2196,7 +2233,7 @@ void TextureCache::NeutralLutFill(Image& image) {
 			uint64_t row = slice_start + y * row_bytes;
 			for (uint32_t x = 0; x < info.extent.width; x++) {
 				uint32_t word = texels[(static_cast<size_t>(z) * 32u + y) * 32u + x];
-				if (guest_linear) {
+				if (guest_linear && rotate) {
 					// The guest keeps the 2-bit component in the low bits; detile rotates.
 					word = std::rotr(word, 30u);
 				}
@@ -2213,6 +2250,11 @@ void TextureCache::NeutralLutFill(Image& image) {
 		    "serial=0x{:016x} row=0x{:x} slice=0x{:x} span=0x{:x}\n",
 		    info.data.address + base, image.serial, row_bytes, slice_bytes, staging.size()));
 		return;
+	}
+	if (guest_linear) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "lut-fill: guest write failed addr=0x{:016x}, falling back to host upload\n",
+		    info.data.address + base));
 	}
 	// Tiled or compressed layouts have no CPU-side packing: upload the host-ordered table
 	// straight into the image, mirroring what InitializeImage does for guest memory.
