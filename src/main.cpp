@@ -237,6 +237,7 @@ static constexpr Flag FLAGS[] = {
     {"--debug-blend-one", &ConfigOptions::debug_blend_one},
     {"--debug-sample-stats", &ConfigOptions::debug_sample_stats},
     {"--debug-dump-flip", &ConfigOptions::debug_dump_flip},
+    {"--debug-lut-identity", &ConfigOptions::debug_lut_identity},
 };
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {

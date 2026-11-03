@@ -1222,6 +1222,54 @@ static const char* BindingTypeName(TextureCache::BindingType type) {
 	return "?";
 }
 
+// Debug: settle the open question of whether the composite LUT holds zeros. The composite
+// exports the 3D-LUT sample as its final color, so replacing every matching lookup table
+// with a constant turns a black screen into a constant-color screen exactly when the LUT
+// content (not the shader or its inputs) is the culprit.
+static void ClearDebugLookupTables(RenderContext&                     context,
+                                   std::span<PreparedBindings* const> stages,
+                                   CommandBuffer&                     buffer) {
+	auto&       cache   = context.GetTextureCache();
+	const auto  command = buffer.Handle();
+	static std::atomic<uint32_t> reported {0};
+	for (const PreparedBindings* stage: stages) {
+		if (stage == nullptr) {
+			continue;
+		}
+		for (const auto& image: stage->images) {
+			if (!image.image_id) {
+				continue;
+			}
+			auto* resolved = cache.TryGetImage(image.image_id);
+			if (resolved == nullptr ||
+			    resolved->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+			    resolved->info.extent.width != 32 || resolved->info.extent.height != 32 ||
+			    resolved->info.extent.depth != 32 || resolved->info.resources.levels != 1) {
+				continue;
+			}
+			vk::ClearColorValue color {};
+			color.float32[0] = 0.25f;
+			color.float32[1] = 0.50f;
+			color.float32[2] = 0.75f;
+			color.float32[3] = 1.0f;
+			const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			resolved->Transit(vk::ImageLayout::eTransferDstOptimal,
+			                  vk::AccessFlagBits2::eTransferWrite, {}, command);
+			command.clearColorImage(resolved->backing.image, vk::ImageLayout::eTransferDstOptimal,
+			                        &color, 1, &range);
+			resolved->Transit(resolved->ReadLayout(), vk::AccessFlagBits2::eShaderRead, {},
+			                  command);
+			cache.MarkGpuWritten(image.image_id);
+			if (reported.fetch_add(1, std::memory_order_relaxed) == 0) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "debug: lut identity test active, cleared image addr=0x{:016x} "
+				    "serial=0x{:016x}\n",
+				    resolved->info.data.address, resolved->serial));
+			}
+		}
+	}
+}
+
 static void LogFlipWatchBindings(RenderContext&                     context,
                                  std::span<PreparedBindings* const> stages, uint64_t tag) {
 	const auto slot = static_cast<uint32_t>(tag - 1);
@@ -1416,6 +1464,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	if (Config::DebugLutIdentityEnabled()) {
+		ClearDebugLookupTables(m_context, stages, buffer);
+	}
 	if (Config::DebugDumpFlipEnabled() && state.flip_watch_tag != 0) {
 		LogFlipWatchBindings(m_context, stages, state.flip_watch_tag);
 	}

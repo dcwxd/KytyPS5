@@ -98,6 +98,7 @@ struct ConfigOptions {
 	bool                   debug_blend_one             = false;
 	bool                   debug_sample_stats          = false;
 	bool                   debug_dump_flip             = false;
+	bool                   debug_lut_identity          = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -174,6 +175,7 @@ bool DebugDepthAlwaysEnabled();
 bool DebugBlendOneEnabled();
 bool DebugSampleStatsEnabled();
 bool DebugDumpFlipEnabled();
+bool DebugLutIdentityEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

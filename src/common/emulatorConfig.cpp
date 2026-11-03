@@ -229,6 +229,10 @@ bool DebugDumpFlipEnabled() {
 	return g_config->debug_dump_flip;
 }
 
+bool DebugLutIdentityEnabled() {
+	return g_config->debug_lut_identity;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
