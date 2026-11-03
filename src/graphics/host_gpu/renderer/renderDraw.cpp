@@ -43,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -1222,31 +1223,39 @@ static const char* BindingTypeName(TextureCache::BindingType type) {
 	return "?";
 }
 
-// Debug: settle the open question of whether the composite LUT holds zeros. The composite
-// exports the 3D-LUT sample as its final color, so replacing every matching lookup table
-// with a constant turns a black screen into a constant-color screen exactly when the LUT
-// content (not the shader or its inputs) is the culprit.
+// Debug: the composite exports the 3D-LUT sample as its final color, and clearing matching
+// lookup tables to a constant proved their real contents were black. Report every unique
+// writer/binding touching such tables, so the game pass producing the LUT can be found, and
+// keep the identity clear so the experiment stays visible.
 static void ClearDebugLookupTables(RenderContext&                     context,
                                    std::span<PreparedBindings* const> stages,
+                                   std::span<const uint64_t>          writers,
                                    CommandBuffer&                     buffer) {
 	auto&       cache   = context.GetTextureCache();
 	const auto  command = buffer.Handle();
 	static std::atomic<uint32_t> reported {0};
-	for (const PreparedBindings* stage: stages) {
+	for (uint32_t stage_id = 0; stage_id < stages.size(); stage_id++) {
+		const PreparedBindings* const stage = stages[stage_id];
 		if (stage == nullptr) {
 			continue;
 		}
-		for (const auto& image: stage->images) {
+		for (uint32_t binding_index = 0; binding_index < stage->images.size(); binding_index++) {
+			const auto& image = stage->images[binding_index];
 			if (!image.image_id) {
 				continue;
 			}
 			auto* resolved = cache.TryGetImage(image.image_id);
 			if (resolved == nullptr ||
 			    resolved->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
-			    resolved->info.extent.width != 32 || resolved->info.extent.height != 32 ||
-			    resolved->info.extent.depth != 32 || resolved->info.resources.levels != 1) {
+			    resolved->info.extent.depth != 32) {
 				continue;
 			}
+			const uint64_t writer =
+			    stage_id < writers.size() ? writers[stage_id] : static_cast<uint64_t>(-1);
+			ReportLutImageUse("graphics", writer, binding_index, BindingTypeName(image.desc.type),
+			                  resolved->serial, resolved->info.data.address,
+			                  resolved->info.extent.width, resolved->info.extent.height,
+			                  resolved->info.extent.depth, resolved->IsGpuModified());
 			vk::ClearColorValue color {};
 			color.float32[0] = 0.25f;
 			color.float32[1] = 0.50f;
@@ -1465,7 +1474,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	if (Config::DebugLutIdentityEnabled()) {
-		ClearDebugLookupTables(m_context, stages, buffer);
+		std::array<uint64_t, 8> writers {};
+		uint32_t                writer_count = 0;
+		for (uint32_t i = 0; i < vertex_stages.size() && writer_count < writers.size(); i++) {
+			writers[writer_count++] =
+			    state.vertex_info[i].stage.module != nullptr
+			        ? state.vertex_info[i].stage.module->id
+			        : 0;
+		}
+		if (state.ps_active && writer_count < writers.size()) {
+			writers[writer_count++] =
+			    state.ps_input_info.stage.module != nullptr
+			        ? state.ps_input_info.stage.module->id
+			        : 0;
+		}
+		// Render targets reach the LUT through color_info rather than image bindings.
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& target = state.color_info[i];
+			if (target.desc.info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+			    target.desc.info.extent.depth != 32) {
+				continue;
+			}
+			ReportLutImageUse(
+			    "graphics-target", writers[0], i, "render-target", 0,
+			    target.desc.info.data.address, target.desc.info.extent.width,
+			    target.desc.info.extent.height, target.desc.info.extent.depth, false);
+		}
+		ClearDebugLookupTables(m_context, stages, std::span {writers.data(), writer_count},
+		                       buffer);
 	}
 	if (Config::DebugDumpFlipEnabled() && state.flip_watch_tag != 0) {
 		LogFlipWatchBindings(m_context, stages, state.flip_watch_tag);

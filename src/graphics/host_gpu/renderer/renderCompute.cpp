@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -391,6 +392,34 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
+	if (Config::DebugLutIdentityEnabled()) {
+		// Same shape as ClearDebugLookupTables on the draw path, but compute passes are the
+		// likely LUT producers, so only report them; their writes stay intact.
+		auto&       cache   = m_context.GetTextureCache();
+		const auto  writer  = input_info.stage.module != nullptr
+			                     ? input_info.stage.module->id
+			                     : static_cast<uint64_t>(0);
+		uint32_t    index   = 0;
+		for (const auto& image: bindings.images) {
+			const auto binding_index = index++;
+			if (!image.image_id) {
+				continue;
+			}
+			auto* resolved = cache.TryGetImage(image.image_id);
+			if (resolved == nullptr ||
+			    resolved->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+			    resolved->info.extent.depth != 32) {
+				continue;
+			}
+			ReportLutImageUse("compute", writer, binding_index,
+			                  image.desc.type == TextureCache::BindingType::Storage
+			                  ? "storage"
+			                  : "texture",
+			                  resolved->serial, resolved->info.data.address,
+			                  resolved->info.extent.width, resolved->info.extent.height,
+			                  resolved->info.extent.depth, resolved->IsGpuModified());
+		}
+	}
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 

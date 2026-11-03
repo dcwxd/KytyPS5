@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cmath>
 #include <fmt/format.h>
+#include <mutex>
+#include <set>
 
 namespace Libs::Graphics {
 
@@ -593,6 +595,34 @@ void LogDrawPhase(const char* draw_name, const char* phase) {
 			LOGF("DrawPhase: %s %s\n", draw_name, phase);
 		}
 	}
+}
+
+void ReportLutImageUse(const char* kind, uint64_t writer, uint32_t binding, const char* type,
+                       uint64_t serial, uint64_t address, uint32_t width, uint32_t height,
+                       uint32_t depth, bool gpu_modified) {
+	struct Key {
+		uint64_t writer;
+		uint64_t serial;
+		uint32_t binding;
+		bool     operator<(const Key& other) const {
+			return writer != other.writer ? writer < other.writer
+			       : serial != other.serial ? serial < other.serial
+			                                : binding < other.binding;
+		}
+	};
+	static std::mutex  lock;
+	static std::set<Key> seen;
+	{
+		const std::scoped_lock guard {lock};
+		if (!seen.emplace(Key {writer, serial, binding}).second) {
+			return;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "lut-use: kind={} writer=0x{:016x} binding={} type={} serial=0x{:016x} addr=0x{:016x} "
+	    "{}x{}x{} gpu_modified={}\n",
+	    kind, writer, binding, type, serial, address, width, height, depth,
+	    gpu_modified ? "true" : "false"));
 }
 
 static void VpPrint(const char* func, const HW::ScreenViewport& vp,
