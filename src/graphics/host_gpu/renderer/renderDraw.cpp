@@ -1308,6 +1308,36 @@ static void ClearDebugLookupTables(RenderContext&                     context,
 	}
 }
 
+// Debug: the composite names the 3D-LUT guest range; once per session, list every cached
+// image overlapping it, so a producer that only ever bound an aliased shape is unmasked.
+static void DebugReportLutOverlapsOnce(TextureCache&                      cache,
+                                       std::span<PreparedBindings* const> stages) {
+	static std::atomic<bool> reported {false};
+	if (reported.load(std::memory_order_relaxed)) {
+		return;
+	}
+	for (const PreparedBindings* const stage: stages) {
+		if (stage == nullptr) {
+			continue;
+		}
+		for (const auto& image: stage->images) {
+			if (!image.image_id) {
+				continue;
+			}
+			const auto* resolved = cache.TryGetImage(image.image_id);
+			if (resolved == nullptr ||
+			    resolved->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+			    resolved->info.extent.depth != 32) {
+				continue;
+			}
+			reported.store(true, std::memory_order_relaxed);
+			cache.DebugReportLutOverlaps(resolved->info.data.address,
+			                             resolved->info.data.size);
+			return;
+		}
+	}
+}
+
 static void LogFlipWatchBindings(RenderContext&                     context,
                                  std::span<PreparedBindings* const> stages, uint64_t tag) {
 	const auto slot = static_cast<uint32_t>(tag - 1);
@@ -1534,6 +1564,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		ClearDebugLookupTables(m_context, stages, std::span {writers.data(), writer_count},
 		                       buffer);
+	}
+	if (Config::DebugDumpFlipEnabled()) {
+		DebugReportLutOverlapsOnce(m_context.GetTextureCache(), stages);
 	}
 	if (Config::DebugDumpFlipEnabled() && state.flip_watch_tag != 0) {
 		LogFlipWatchBindings(m_context, stages, state.flip_watch_tag);

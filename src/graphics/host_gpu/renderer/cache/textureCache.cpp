@@ -803,6 +803,50 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (!cached.registered) {
 		return {merged_id};
 	}
+	// GCN dual views: one allocation is both a volume and its 2D-array view (slices are
+	// depth slices; rendering binds the array shape while sampling binds the volume). Their
+	// guest layouts agree when the base shape matches, so unify the shapes instead of
+	// forking resident images whose writes and reads can never meet.
+	if (binding != BindingType::DepthTarget && !requested.IsDepth() && !cached.info.IsDepth() &&
+	    requested.tile_mode == cached.info.tile_mode &&
+	    requested.pixel_format == cached.info.pixel_format &&
+	    requested.bytes_per_block == cached.info.bytes_per_block &&
+	    requested.data.address == cached.info.data.address &&
+	    requested.resources.levels == 1 && cached.info.resources.levels == 1 &&
+	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
+	    requested.extent.width == cached.info.extent.width &&
+	    requested.extent.height == cached.info.extent.height &&
+	    requested.type != cached.info.type &&
+	    ((requested.IsVolume() &&
+	      (cached.info.type == Prospero::ImageType::kColor2D ||
+	       cached.info.type == Prospero::ImageType::kColor2DArray)) ||
+	     (!requested.IsVolume() && cached.info.IsVolume() &&
+	      (requested.type == Prospero::ImageType::kColor2D ||
+	       requested.type == Prospero::ImageType::kColor2DArray)))) {
+		const bool requested_volume = requested.IsVolume();
+		const uint32_t requested_slices = requested_volume ? requested.extent.depth
+		                                                   : requested.resources.layers;
+		const uint32_t cached_slices = cached.info.IsVolume() ? cached.info.extent.depth
+		                                                      : cached.info.resources.layers;
+		if (requested_slices == cached_slices && requested_slices != 0) {
+			if (Config::DebugDumpFlipEnabled()) {
+				LOGF("volume-unify: %s view of %s addr=0x%016" PRIx64 " fmt=%s %ux%u slices=%u"
+				     " levels=1\n",
+				     requested_volume ? "volume" : "array",
+				     requested_volume ? "array" : "volume",
+				     requested.data.address, vk::to_string(requested.pixel_format).c_str(),
+				     requested.extent.width, requested.extent.height, requested_slices);
+			}
+			if (requested_volume) {
+				// Vulkan cannot view an array as a volume; promote the volume to the
+				// native image and carry the array's contents over.
+				return {ExpandImage(requested, cached_id)};
+			}
+			// The volume backs the array view natively (e2DArrayCompatible); keep the
+			// requested view (its slice offset selects depth slices).
+			return {cached_id};
+		}
+	}
 	// PS5: image heaps keep BC images and raw block views of their layers resident together, so a
 	// raw read of a layer subset with the same levels views the BC image instead of evicting it.
 	const bool raw_view = binding == BindingType::Texture && !requested.IsBlock() &&
@@ -1378,7 +1422,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (desc.info.resources.levels > resolved.info.resources.levels ||
+			           desc.info.resources.layers >
+			               (resolved.info.IsVolume()
+			                    ? std::max(resolved.info.extent.depth, 1u)
+			                    : resolved.info.resources.layers)) {
+				// A volume's depth plays the layer role for its array views; a request
+				// within that capacity views the resident image instead of replacing it.
 				FreeImage(result);
 				result = {};
 			}
@@ -2007,6 +2057,27 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size, false).empty();
+}
+
+void TextureCache::DebugReportLutOverlaps(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id) {
+			continue;
+		}
+		LOGF("lut-overlap: serial=0x%016" PRIx64 " fmt=%s extent=%ux%ux%u layers=%u "
+		     "imgtype=%u addr=0x%016" PRIx64 " size=0x%016" PRIx64 " gpu_modified=%s "
+		     "buffer_modified=%s cpu_dirty=%s rt=%s\n",
+		     image->serial, vk::to_string(image->info.pixel_format).c_str(),
+		     image->info.extent.width, image->info.extent.height, image->info.extent.depth,
+		     image->info.resources.layers, static_cast<uint32_t>(image->info.type),
+		     image->info.data.address, image->info.data.size,
+		     image->IsGpuModified() ? "true" : "false",
+		     image->IsBufferModified() ? "true" : "false",
+		     image->IsCpuDirty() ? "true" : "false",
+		     image->usage.render_target ? "true" : "false");
+	}
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
